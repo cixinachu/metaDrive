@@ -1,0 +1,9 @@
+{
+  "environment": {"horizon": 1000, "traffic_density": 0.10, "reward_mode": "cmdp", "map": 3, "physics_world_step_size": 0.02, "decision_repeat": 5, "lane_width": 3.5, "lane_num": 3, "exit_length": 50, "force_destroy": true},
+  "reward": {"driving_reward": 1.0, "speed_reward": 0.1, "success_reward": 10.0, "use_lateral_reward": false},
+  "termination": {"terminate_on_collision": false, "terminate_on_out_of_road": true},
+  "scenario": {"split": "train", "start_seed": 1000, "num_scenarios": 1000, "type": "procedural"},
+  "seeds": {"rl_seed": 0, "environment_seed": 42, "traffic_seed": 43, "evaluation_seed": 44},
+  "traffic": {"randomize_behavior": false, "mode": "trigger", "vehicle_config": {}},
+  "safety": {"cost_mode": "continuous", "ttc_threshold": 4.0, "min_distance": 2.0, "time_headway": 1.5, "comfortable_deceleration": 3.0, "prediction_horizon": 4.0, "encounter_margin": 2.0, "road_margin": 1.0, "road_sensor_range": 20.0, "road_sensor_rays": 120, "same_direction_cosine": 0.866025403784, "vehicle_risk_aggregation": "max", "critical_threshold": 0.5, "epsilon": 0.000001}
+}

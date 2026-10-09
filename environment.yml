@@ -1,0 +1,16 @@
+name: llm_drive
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - metadrive-simulator==0.4.3
+      - stable-baselines3[extra]==2.3.2
+      - gymnasium==0.29.1
+      - torch==2.3.1
+      - opencv-python==4.10.0.84
+      - tensorboard
+      - pandas
+      - numpy==1.26.4

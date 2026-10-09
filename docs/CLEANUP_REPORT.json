@@ -1,0 +1,393 @@
+{
+  "date": "2026-09-24",
+  "retained_model_runs": [
+    "sac_metadrive_20260922_161725_430654",
+    "sac_metadrive_20260922_162141_754326",
+    "sac_metadrive_20260922_162550_315328",
+    "20260923_232801_train_419217"
+  ],
+  "retained_acceptance": "outputs/frozen",
+  "moved_user_run": "models/20260923_232801_train_419217",
+  "removed": [
+    {
+      "path": "models/20260924_000611_train_887737",
+      "files": 17,
+      "bytes": 1474248
+    },
+    {
+      "path": "models/20260924_000625_train_523593",
+      "files": 17,
+      "bytes": 1974049
+    },
+    {
+      "path": "models/20260924_000642_train_437852",
+      "files": 17,
+      "bytes": 2451167
+    },
+    {
+      "path": "models/20260924_000700_train_001233",
+      "files": 17,
+      "bytes": 2200300
+    },
+    {
+      "path": "models/sac_metadrive_20260909_201218_138342",
+      "files": 14,
+      "bytes": 71029219
+    },
+    {
+      "path": "models/sac_metadrive_20260922_142927_576155",
+      "files": 4,
+      "bytes": 5918823
+    },
+    {
+      "path": "models/sac_metadrive_20260922_143413_666299",
+      "files": 4,
+      "bytes": 5918833
+    },
+    {
+      "path": "models/sac_metadrive_20260922_144953_820240",
+      "files": 4,
+      "bytes": 5921445
+    },
+    {
+      "path": "logs/sac_metadrive_20260922_142927_576155",
+      "files": 3,
+      "bytes": 9824
+    },
+    {
+      "path": "logs/sac_metadrive_20260922_143413_666299",
+      "files": 3,
+      "bytes": 9821
+    },
+    {
+      "path": "logs/sac_metadrive_20260922_144953_820240",
+      "files": 3,
+      "bytes": 368214
+    },
+    {
+      "path": "results/20260924_000618_eval_295011",
+      "files": 11,
+      "bytes": 37206
+    },
+    {
+      "path": "results/20260924_000635_eval_927701",
+      "files": 11,
+      "bytes": 37175
+    },
+    {
+      "path": "results/20260924_000653_eval_286376",
+      "files": 11,
+      "bytes": 37245
+    },
+    {
+      "path": "results/20260924_000712_eval_898687",
+      "files": 11,
+      "bytes": 37191
+    },
+    {
+      "path": "outputs/algorithm_registry_validation.json",
+      "files": 1,
+      "bytes": 885
+    },
+    {
+      "path": "outputs/baseline_comparison.json",
+      "files": 1,
+      "bytes": 5047
+    },
+    {
+      "path": "outputs/controlled_distance_sweep.csv",
+      "files": 1,
+      "bytes": 2160
+    },
+    {
+      "path": "outputs/controlled_ttc_sweep.csv",
+      "files": 1,
+      "bytes": 2633
+    },
+    {
+      "path": "outputs/cost_diagnostics.csv",
+      "files": 1,
+      "bytes": 8711487
+    },
+    {
+      "path": "outputs/idm_100",
+      "files": 6,
+      "bytes": 9084480
+    },
+    {
+      "path": "outputs/idm_failure_inspection.json",
+      "files": 1,
+      "bytes": 16695
+    },
+    {
+      "path": "outputs/learning_matrix",
+      "files": 37,
+      "bytes": 52774
+    },
+    {
+      "path": "outputs/learning_sanity",
+      "files": 4,
+      "bytes": 186226
+    },
+    {
+      "path": "outputs/random_100",
+      "files": 6,
+      "bytes": 13191088
+    },
+    {
+      "path": "outputs/sac_smoke",
+      "files": 3,
+      "bytes": 3242
+    },
+    {
+      "path": "outputs/smoke_matrix",
+      "files": 37,
+      "bytes": 53741
+    },
+    {
+      "path": "outputs/studio",
+      "files": 341,
+      "bytes": 45076915
+    },
+    {
+      "path": "outputs/studio_browser_curve.csv",
+      "files": 1,
+      "bytes": 162
+    },
+    {
+      "path": "outputs/studio_browser_validation.json",
+      "files": 1,
+      "bytes": 179
+    },
+    {
+      "path": "outputs/studio_compute_benchmark.json",
+      "files": 1,
+      "bytes": 289
+    },
+    {
+      "path": "outputs/studio_controls_validation.json",
+      "files": 1,
+      "bytes": 545
+    },
+    {
+      "path": "outputs/studio_evaluation_ui.png",
+      "files": 1,
+      "bytes": 207772
+    },
+    {
+      "path": "outputs/studio_mobile_ui.png",
+      "files": 1,
+      "bytes": 73444
+    },
+    {
+      "path": "outputs/studio_preview_ui.png",
+      "files": 1,
+      "bytes": 198809
+    },
+    {
+      "path": "outputs/studio_speed_curve.csv",
+      "files": 1,
+      "bytes": 1759
+    },
+    {
+      "path": "outputs/studio_speed_probe",
+      "files": 1,
+      "bytes": 23860
+    },
+    {
+      "path": "outputs/studio_speed_ui.png",
+      "files": 1,
+      "bytes": 222740
+    },
+    {
+      "path": "outputs/studio_speed_ui_validation.json",
+      "files": 1,
+      "bytes": 224
+    },
+    {
+      "path": "outputs/studio_training_ui.png",
+      "files": 1,
+      "bytes": 203180
+    },
+    {
+      "path": "outputs/studio_validation.json",
+      "files": 1,
+      "bytes": 1041
+    },
+    {
+      "path": "outputs/validation_summary.json",
+      "files": 1,
+      "bytes": 7088
+    },
+    {
+      "path": "agent",
+      "files": 16,
+      "bytes": 99442
+    },
+    {
+      "path": ".local",
+      "files": 70,
+      "bytes": 8436051449
+    },
+    {
+      "path": "experiments",
+      "files": 0,
+      "bytes": 0
+    },
+    {
+      "path": "env/driving_env.py",
+      "files": 1,
+      "bytes": 1953
+    },
+    {
+      "path": "scripts/test_metadrive.py",
+      "files": 1,
+      "bytes": 1812
+    },
+    {
+      "path": "scripts/run_sac_smoke.py",
+      "files": 1,
+      "bytes": 2001
+    },
+    {
+      "path": "scripts/run_learning_sanity.py",
+      "files": 1,
+      "bytes": 1851
+    },
+    {
+      "path": "scripts/plot_learning_sanity.py",
+      "files": 1,
+      "bytes": 1865
+    },
+    {
+      "path": "scripts/monitor_learning.py",
+      "files": 1,
+      "bytes": 1889
+    },
+    {
+      "path": "scripts/finalize_environment_validation.py",
+      "files": 1,
+      "bytes": 2419
+    },
+    {
+      "path": "scripts/revalidate_frozen_environment.py",
+      "files": 1,
+      "bytes": 2688
+    },
+    {
+      "path": "scripts/check_rollout_reproducibility.py",
+      "files": 1,
+      "bytes": 2571
+    },
+    {
+      "path": "scripts/inspect_failure_events.py",
+      "files": 1,
+      "bytes": 2040
+    },
+    {
+      "path": "env/__pycache__",
+      "files": 7,
+      "bytes": 23921
+    },
+    {
+      "path": "rl/__pycache__",
+      "files": 12,
+      "bytes": 55370
+    },
+    {
+      "path": "scripts/__pycache__",
+      "files": 5,
+      "bytes": 26153
+    },
+    {
+      "path": "studio/__pycache__",
+      "files": 5,
+      "bytes": 30573
+    },
+    {
+      "path": "tests/__pycache__",
+      "files": 13,
+      "bytes": 26635
+    },
+    {
+      "path": "models/20260924_120051_train_386588",
+      "reason": "post-cleanup integration smoke output"
+    },
+    {
+      "path": "results/20260924_120059_eval_738554",
+      "reason": "post-cleanup integration smoke output"
+    },
+    {
+      "path": "models/20260924_120106_train_936301",
+      "reason": "post-cleanup integration smoke output"
+    },
+    {
+      "path": "results/20260924_120115_eval_101455",
+      "reason": "post-cleanup integration smoke output"
+    },
+    {
+      "path": "models/20260924_120122_train_095462",
+      "reason": "post-cleanup integration smoke output"
+    },
+    {
+      "path": "results/20260924_120130_eval_621936",
+      "reason": "post-cleanup integration smoke output"
+    },
+    {
+      "path": "models/20260924_120136_train_583598",
+      "reason": "post-cleanup integration smoke output"
+    },
+    {
+      "path": "results/20260924_120146_eval_716304",
+      "reason": "post-cleanup integration smoke output"
+    }
+  ],
+  "removed_bytes": 8611087857,
+  "verification": {
+    "environment_tests": 23,
+    "algorithm_and_log_tests": 7,
+    "retained_models_load": true,
+    "integration": {
+      "sac": {
+        "train": "20260924_120051_train_386588",
+        "eval": "20260924_120059_eval_738554",
+        "train_steps": 160,
+        "eval_episodes": 2,
+        "scalar_tags": 49,
+        "tensorboard_download": true,
+        "curve_download": true,
+        "frame": true
+      },
+      "sac_lagrangian": {
+        "train": "20260924_120106_train_936301",
+        "eval": "20260924_120115_eval_101455",
+        "train_steps": 160,
+        "eval_episodes": 2,
+        "scalar_tags": 55,
+        "tensorboard_download": true,
+        "curve_download": true,
+        "frame": true
+      },
+      "wcsac": {
+        "train": "20260924_120122_train_095462",
+        "eval": "20260924_120130_eval_621936",
+        "train_steps": 160,
+        "eval_episodes": 2,
+        "scalar_tags": 55,
+        "tensorboard_download": true,
+        "curve_download": true,
+        "frame": true
+      },
+      "wcsac_iqn": {
+        "train": "20260924_120136_train_583598",
+        "eval": "20260924_120146_eval_716304",
+        "train_steps": 160,
+        "eval_episodes": 2,
+        "scalar_tags": 55,
+        "tensorboard_download": true,
+        "curve_download": true,
+        "frame": true
+      }
+    }
+  }
+}

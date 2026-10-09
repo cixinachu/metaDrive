@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.local/
+
+# Local NGSIM/HighD data and materialized trajectory clips (download separately).
+/datasets/raw/
+/datasets/processed/
+
+# Training products, experiment outputs, and local logs stay on this machine.
+/models/
+/results/
+/outputs/
+/logs/
+/tensorboard/
+
+# Local environment/editor artifacts and credentials.
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+*.pem
+*.key
+*.token

@@ -1,0 +1,205 @@
+{
+  "version": "ngsim-mainline-v2",
+  "config_sha256": "98bb5a12741cedadad09360e2114b788e2fe6e4a7915af508f33fc94f78da4c3",
+  "selection_code_sha256": "74019d19711f45d5fd3ac1ec60a2273e779b963530d52b0f9a61548ca811b6f4",
+  "source_sha256": "bded4a5764be1ad5f1a9666acfdd3f0b13f3661031d2a5a6109e7a1a9d142d50",
+  "downloaded_rows": 11850526,
+  "screened_highway_rows": 9369320,
+  "audit": [
+    {
+      "recording": "i-80:1113433134900",
+      "split": "train",
+      "conflicting_vehicle_ids": [],
+      "unique_rows": 1262678,
+      "first_ms": 1113433135300,
+      "last_ms": 1113434136500,
+      "counts": {
+        "conflicting_tracks": 0,
+        "vehicles": 2052,
+        "accepted_candidates": 486,
+        "outside_approximate_road": 447,
+        "background_position_jump": 991,
+        "not_passenger_car": 110,
+        "initial_ego_overlap": 6,
+        "insufficient_continuous_20s": 1,
+        "position_jump_velocity": 11
+      }
+    },
+    {
+      "recording": "i-80:1113436766900",
+      "split": "validation",
+      "conflicting_vehicle_ids": [],
+      "unique_rows": 1549918,
+      "first_ms": 1113436767500,
+      "last_ms": 1113437746100,
+      "counts": {
+        "conflicting_tracks": 0,
+        "vehicles": 1836,
+        "accepted_candidates": 1206,
+        "outside_approximate_road": 377,
+        "not_passenger_car": 94,
+        "initial_ego_overlap": 14,
+        "background_position_jump": 145
+      }
+    },
+    {
+      "recording": "i-80:1113437564900",
+      "split": "validation",
+      "conflicting_vehicle_ids": [],
+      "unique_rows": 1753791,
+      "first_ms": 1113437565600,
+      "last_ms": 1113438734000,
+      "counts": {
+        "conflicting_tracks": 0,
+        "vehicles": 1790,
+        "accepted_candidates": 1215,
+        "background_position_jump": 18,
+        "outside_approximate_road": 481,
+        "not_passenger_car": 66,
+        "initial_ego_overlap": 10
+      }
+    },
+    {
+      "location": "i-80",
+      "raw_rows": 4566387,
+      "exact_duplicates_removed": 0,
+      "projection_duplicates_removed": 0
+    },
+    {
+      "recording": "us-101:1118846978900",
+      "split": "test_ood",
+      "conflicting_vehicle_ids": [],
+      "unique_rows": 1180598,
+      "first_ms": 1118846979700,
+      "last_ms": 1118847932500,
+      "counts": {
+        "conflicting_tracks": 0,
+        "vehicles": 2169,
+        "accepted_candidates": 1590,
+        "not_passenger_car": 83,
+        "insufficient_continuous_20s": 88,
+        "outside_approximate_road": 47,
+        "background_position_jump": 357,
+        "initial_ego_overlap": 4
+      }
+    },
+    {
+      "recording": "us-101:1118847842000",
+      "split": "test_ood",
+      "conflicting_vehicle_ids": [],
+      "unique_rows": 1403095,
+      "first_ms": 1118847843000,
+      "last_ms": 1118848842000,
+      "counts": {
+        "conflicting_tracks": 0,
+        "vehicles": 2017,
+        "not_passenger_car": 54,
+        "accepted_candidates": 1873,
+        "outside_approximate_road": 32,
+        "insufficient_continuous_20s": 57,
+        "initial_ego_overlap": 1
+      }
+    },
+    {
+      "recording": "us-101:1118848757000",
+      "split": "test_ood",
+      "conflicting_vehicle_ids": [],
+      "unique_rows": 1515240,
+      "first_ms": 1118848757500,
+      "last_ms": 1118849752200,
+      "counts": {
+        "conflicting_tracks": 0,
+        "vehicles": 1915,
+        "accepted_candidates": 1789,
+        "outside_approximate_road": 34,
+        "not_passenger_car": 45,
+        "insufficient_continuous_20s": 44,
+        "initial_ego_overlap": 3
+      }
+    },
+    {
+      "location": "us-101",
+      "raw_rows": 4802933,
+      "exact_duplicates_removed": 704000,
+      "projection_duplicates_removed": 0
+    }
+  ],
+  "candidates": 9708,
+  "quality_eligible": 8159,
+  "selected": 708,
+  "materialization_rejections": {},
+  "strata": [
+    {
+      "split": "train",
+      "event_class": "ego_lane_change",
+      "candidates": 148,
+      "selected": 70
+    },
+    {
+      "split": "train",
+      "event_class": "cut_in",
+      "candidates": 38,
+      "selected": 8
+    },
+    {
+      "split": "train",
+      "event_class": "car_following",
+      "candidates": 280,
+      "selected": 70
+    },
+    {
+      "split": "train",
+      "event_class": "other_mainline",
+      "candidates": 20,
+      "selected": 0
+    },
+    {
+      "split": "validation",
+      "event_class": "ego_lane_change",
+      "candidates": 691,
+      "selected": 70
+    },
+    {
+      "split": "validation",
+      "event_class": "cut_in",
+      "candidates": 126,
+      "selected": 70
+    },
+    {
+      "split": "validation",
+      "event_class": "car_following",
+      "candidates": 1482,
+      "selected": 70
+    },
+    {
+      "split": "validation",
+      "event_class": "other_mainline",
+      "candidates": 122,
+      "selected": 70
+    },
+    {
+      "split": "test_ood",
+      "event_class": "ego_lane_change",
+      "candidates": 851,
+      "selected": 70
+    },
+    {
+      "split": "test_ood",
+      "event_class": "cut_in",
+      "candidates": 297,
+      "selected": 70
+    },
+    {
+      "split": "test_ood",
+      "event_class": "car_following",
+      "candidates": 3822,
+      "selected": 70
+    },
+    {
+      "split": "test_ood",
+      "event_class": "other_mainline",
+      "candidates": 282,
+      "selected": 70
+    }
+  ]
+}

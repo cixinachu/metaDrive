@@ -1,0 +1,35 @@
+{
+  "version": "ngsim-representative-classes-v2",
+  "description": "Compact labels backed by materialized NGSIM highway trajectory clips. Counts come from selected manifests; labels do not imply a reactive MetaDrive traffic model.",
+  "sites": [
+    {
+      "id": "us-101",
+      "label": "US-101",
+      "road_type": "freeway",
+      "categories": [
+        {"id": "mainline", "label": "主线普通行驶", "event_classes": ["other_mainline"], "definition": "未检测到自车换道、周边车辆切入或达到跟驰连续时长阈值的主线窗口。"},
+        {"id": "car_following", "label": "跟驰", "event_classes": ["car_following"], "definition": "同车道前车关系持续超过筛选协议规定时长的窗口。"},
+        {"id": "cut_in", "label": "邻车切入", "event_classes": ["cut_in"], "definition": "周边车道车辆切入自车车道并改变前车关系的窗口。"},
+        {"id": "lane_change", "label": "自车换道", "event_classes": ["ego_lane_change"], "definition": "自车轨迹中检测到稳定车道编号变化的窗口。"}
+      ]
+    },
+    {
+      "id": "i-80",
+      "label": "I-80",
+      "road_type": "freeway",
+      "categories": [
+        {"id": "mainline", "label": "主线普通行驶", "event_classes": ["other_mainline"], "definition": "未检测到自车换道、周边车辆切入或达到跟驰连续时长阈值的主线窗口。"},
+        {"id": "car_following", "label": "跟驰", "event_classes": ["car_following"], "definition": "同车道前车关系持续超过筛选协议规定时长的窗口。"},
+        {"id": "cut_in", "label": "邻车切入", "event_classes": ["cut_in"], "definition": "周边车道车辆切入自车车道并改变前车关系的窗口。"},
+        {"id": "lane_change", "label": "自车换道", "event_classes": ["ego_lane_change"], "definition": "自车轨迹中检测到稳定车道编号变化的窗口。"}
+      ]
+    }
+  ],
+  "availability": {
+    "dataset_experiments": ["ngsim-mainline-v1", "ngsim-mainline-v2"],
+    "currently_materialized": 1058,
+    "class_counts": {"other_mainline": 220, "car_following": 300, "cut_in": 238, "ego_lane_change": 300},
+    "selection_protocols": ["configs/datasets/ngsim_selection_v1.json", "configs/datasets/ngsim_selection_v2.json"],
+    "other_sites_and_categories": "not included in this compact selector until clips and matching road networks are validated"
+  }
+}
