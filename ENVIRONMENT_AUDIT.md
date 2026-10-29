@@ -82,7 +82,7 @@ Evidence from the current environment:
   - `physics_world_step_size: 0.02`
   - `traffic_mode: trigger`
 
-This is the source of truth for the current code path.
+This describes the installed MetaDrive package defaults. The research platform overrides this package default in `configs/env/base.yaml` and the Studio configuration: its formal Highway default is now `map="S"` (Highway Straight).
 
 ---
 

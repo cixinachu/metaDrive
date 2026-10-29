@@ -1,0 +1,256 @@
+"""Alternating dual-policy PPO / Social-AIRL training loop.
+
+The update ordering, reward recovery, discriminator labels and PPO objective
+follow the public main_helbing.py + PPO.py. This loop expects explicitly paired
+expert transitions built from source-verified ELCV/RFV/leader role assignments.
+"""
+from dataclasses import dataclass
+from pathlib import Path
+import json
+import numpy as np
+import torch
+from torch import nn
+
+from rl.srairl.config import SRAIRLConfig
+from rl.srairl.discriminator import AnisotropicInteractionPotential, SocialAIRLDiscrim
+from rl.srairl.ppo import PPO
+from env.tasks.srairl_env import SRAIRLEnv
+
+
+@dataclass(frozen=True)
+class SRAIRLTrainingConfig:
+    episodes: int = 110001
+    action_scale: float = 5.0
+    actor_lr: float = 3e-4
+    critic_lr: float = 1e-3
+    discriminator_lr: float = 3e-4
+    ppo_epochs: int = 80
+    clip_epsilon: float = 0.2
+    initial_action_std: float = 0.2
+    action_std_decay: float = 0.05
+    minimum_action_std: float = 0.1
+    decay_every_steps: int = 100000
+    discriminator_every_episodes: int = 150
+    discriminator_batch_size: int = 64
+    discriminator_updates: int = 10
+    lambda_social: float = 0.0
+    lambda_equilibrium: float = 0.01
+    seed: int = 0
+    device: str = "auto"
+
+    def __post_init__(self):
+        if self.episodes < 1 or self.action_scale <= 0 or self.ppo_epochs < 1:
+            raise ValueError("episodes/action_scale/ppo_epochs must be positive")
+        if self.discriminator_every_episodes < 1 or self.discriminator_batch_size < 2 or self.discriminator_updates < 1:
+            raise ValueError("invalid discriminator update schedule")
+        if self.device not in ("auto", "cpu", "cuda"):
+            raise ValueError("device must be auto, cpu or cuda")
+        if self.device == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA was requested but is unavailable")
+
+
+class ExpertTransitions:
+    def __init__(self, transitions, device):
+        pairs = {}
+        for transition in transitions:
+            pairs.setdefault((transition.scenario_id, transition.step_index), {})[transition.agent] = transition
+        pairs = [pair for pair in pairs.values() if "elcv" in pair and "rfv" in pair]
+        if not pairs:
+            raise ValueError("no paired ELCV/RFV expert transitions were supplied")
+        for pair in pairs:
+            a, b = pair["elcv"], pair["rfv"]
+            if not (np.array_equal(a.state, b.state) and np.array_equal(a.next_state, b.next_state) and a.done == b.done):
+                raise ValueError("paired expert transitions must share state, next_state and done")
+        self.states = torch.as_tensor(np.stack([p["elcv"].state for p in pairs]), dtype=torch.float32, device=device)
+        self.next_states = torch.as_tensor(np.stack([p["elcv"].next_state for p in pairs]), dtype=torch.float32, device=device)
+        self.dones = torch.as_tensor([p["elcv"].done for p in pairs], dtype=torch.float32, device=device)
+        self.actions_elcv = torch.as_tensor(np.stack([p["elcv"].action for p in pairs]), dtype=torch.float32, device=device)
+        self.actions_rfv = torch.as_tensor(np.stack([p["rfv"].action for p in pairs]), dtype=torch.float32, device=device)
+
+    def sample(self, batch_size):
+        idx = torch.randint(len(self.states), (batch_size,), device=self.states.device)
+        return {"states": self.states[idx], "next_states": self.next_states[idx], "dones": self.dones[idx],
+                "actions_elcv": self.actions_elcv[idx], "actions_rfv": self.actions_rfv[idx]}
+
+
+class SRAIRLTrainer:
+    def __init__(self, envs, expert_transitions, config=None, training_config=None, output_dir=None):
+        if not envs:
+            raise ValueError("at least one SRAIRLEnv is required")
+        self.envs = list(envs)
+        if any(not isinstance(env, SRAIRLEnv) for env in self.envs):
+            raise TypeError("SR-AIRL trainer accepts only the two-actor SRAIRLEnv")
+        if any(env.dynamics_modes and env.observer.history_len != (config or SRAIRLConfig.from_mapping()).history_len for env in self.envs):
+            raise ValueError("all interaction environments must use configured history length")
+        self.config = config or SRAIRLConfig.from_mapping()
+        self.train_config = training_config or SRAIRLTrainingConfig()
+        if self.train_config.device == "auto":
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        else:
+            self.device = torch.device(self.train_config.device)
+        torch.manual_seed(self.train_config.seed)
+        np.random.seed(self.train_config.seed)
+        self.expert = ExpertTransitions(expert_transitions, self.device)
+        state_dim = self.config.frame_state_dim * self.config.history_len
+        self.policy_elcv = PPO(state_dim, 2, self.train_config.actor_lr, self.train_config.critic_lr,
+            self.config.gamma, self.train_config.ppo_epochs, self.train_config.clip_epsilon,
+            self.train_config.initial_action_std, self.device)
+        self.policy_rfv = PPO(state_dim, 2, self.train_config.actor_lr, self.train_config.critic_lr,
+            self.config.gamma, self.train_config.ppo_epochs, self.train_config.clip_epsilon,
+            self.train_config.initial_action_std, self.device)
+        self.shared_potential = AnisotropicInteractionPotential(self.config.potential_longitudinal_scale,
+            self.config.potential_lateral_scale, self.config.direction_lambda,
+            pos_lat_scale=self.config.pos_lat_scale,pos_long_scale=self.config.pos_long_scale,
+            vel_scale=self.config.vel_scale,vel_offset=self.config.vel_offset).to(self.device)
+        self.discriminator_elcv = SocialAIRLDiscrim(state_dim, self.config.gamma, self.shared_potential,
+            self.config.alpha_init, role="lcv", history_len=self.config.history_len).to(self.device)
+        self.discriminator_rfv = SocialAIRLDiscrim(state_dim, self.config.gamma, self.shared_potential,
+            self.config.alpha_init, role="fv", history_len=self.config.history_len).to(self.device)
+        parameters = list(self.discriminator_elcv.private_g.parameters()) + list(self.discriminator_elcv.h.parameters()) + [self.discriminator_elcv.alpha_raw]
+        parameters += list(self.discriminator_rfv.private_g.parameters()) + list(self.discriminator_rfv.h.parameters()) + [self.discriminator_rfv.alpha_raw]
+        self.discriminator_optimizer = torch.optim.Adam(parameters, lr=self.train_config.discriminator_lr)
+        self.bce = nn.BCELoss()
+        self.output_dir = Path(output_dir) if output_dir else None
+        self.global_steps = 0
+        self.episode = 0
+        self.next_decay_step = self.train_config.decay_every_steps
+        if self.output_dir:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def _collect_episode(self, env):
+        observations, _ = env.reset()
+        state = observations["elcv"]
+        tracking_return = 0.0
+        while True:
+            state_t, action_e, log_e, value_e = self.policy_elcv.select_action(state)
+            _, action_f, log_f, value_f = self.policy_rfv.select_action(state)
+            next_observations, info = env.step({
+                "elcv": action_e.squeeze(0).detach().cpu().numpy() * self.train_config.action_scale,
+                "rfv": action_f.squeeze(0).detach().cpu().numpy() * self.train_config.action_scale,
+            })
+            next_state = next_observations["elcv"]
+            done = bool(info["done"])
+            tracking_reward = float(info["tracking_reward"])
+            next_t = torch.as_tensor(next_state, dtype=torch.float32, device=self.device).reshape(1, -1)
+            self.policy_elcv.buffer.add(state_t, action_e, log_e, value_e, tracking_reward, done, next_t)
+            self.policy_rfv.buffer.add(state_t, action_f, log_f, value_f, tracking_reward, done, next_t)
+            tracking_return += tracking_reward
+            self.global_steps += 1
+            state = next_state
+            while self.global_steps >= self.next_decay_step:
+                self.policy_elcv.decay_action_std(self.train_config.action_std_decay, self.train_config.minimum_action_std)
+                self.policy_rfv.decay_action_std(self.train_config.action_std_decay, self.train_config.minimum_action_std)
+                self.next_decay_step += self.train_config.decay_every_steps
+            if done:
+                return tracking_return
+
+    @staticmethod
+    def _finite(*tensors):
+        return all(torch.isfinite(t).all().item() for t in tensors)
+
+    def _discriminator_update(self):
+        d = self.train_config
+        losses, accuracies, private_values, potentials = [], [], [], []
+        self.policy_elcv.policy.eval(); self.policy_rfv.policy.eval()
+        for _ in range(d.discriminator_updates):
+            gen_e = self.policy_elcv.buffer.sample(d.discriminator_batch_size)
+            gen_f = self.policy_rfv.buffer.sample(d.discriminator_batch_size)
+            exp = self.expert.sample(d.discriminator_batch_size)
+            if not self._finite(gen_e["states"], gen_f["states"], exp["states"], gen_e["next_states"], exp["next_states"]):
+                continue
+            with torch.no_grad():
+                log_exp_e, _, _ = self.policy_elcv.policy.evaluate(exp["states"], exp["actions_elcv"] / d.action_scale)
+                log_exp_f, _, _ = self.policy_rfv.policy.evaluate(exp["states"], exp["actions_rfv"] / d.action_scale)
+            p_gen_e = self.discriminator_elcv(gen_e["states"], gen_e["dones"], gen_e["logprobs"], gen_e["next_states"])
+            p_exp_e = self.discriminator_elcv(exp["states"], exp["dones"], log_exp_e, exp["next_states"])
+            p_gen_f = self.discriminator_rfv(gen_f["states"], gen_f["dones"], gen_f["logprobs"], gen_f["next_states"])
+            p_exp_f = self.discriminator_rfv(exp["states"], exp["dones"], log_exp_f, exp["next_states"])
+            p_gen_e, p_exp_e = p_gen_e.clamp(.05,.95), p_exp_e.clamp(.05,.95)
+            p_gen_f, p_exp_f = p_gen_f.clamp(.05,.95), p_exp_f.clamp(.05,.95)
+            loss = self.bce(p_exp_e, torch.full_like(p_exp_e,.9)) + self.bce(p_exp_f, torch.full_like(p_exp_f,.9))
+            loss += self.bce(p_gen_e, torch.full_like(p_gen_e,.1)) + self.bce(p_gen_f, torch.full_like(p_gen_f,.1))
+            social = loss.new_zeros(()); equilibrium = loss.new_zeros(())
+            if d.lambda_social > 0:
+                _, private_e, _ = self.discriminator_elcv.get_reward(exp["states"])
+                _, private_f, _ = self.discriminator_rfv.get_reward(exp["states"])
+                social = private_e.square().mean() + private_f.square().mean()
+            if d.lambda_equilibrium > 0:
+                adv_e = self.discriminator_elcv.f(exp["states"], exp["dones"], exp["next_states"]).clamp(-5,5)
+                adv_f = self.discriminator_rfv.f(exp["states"], exp["dones"], exp["next_states"]).clamp(-5,5)
+                equilibrium = adv_e.square().mean() + adv_f.square().mean()
+            total = loss + d.lambda_social*social + d.lambda_equilibrium*equilibrium
+            self.discriminator_optimizer.zero_grad(); total.backward(); self.discriminator_optimizer.step()
+            losses.append(float(total.detach().cpu()))
+            accuracies.append((float((p_exp_e>.5).float().mean()), float((p_gen_e<.5).float().mean()),
+                               float((p_exp_f>.5).float().mean()), float((p_gen_f<.5).float().mean())))
+            with torch.no_grad():
+                _, _, phi = self.discriminator_elcv.get_reward(exp["states"])
+                private_values.append(float(self.discriminator_elcv.get_reward(exp["states"])[1].mean().cpu()))
+                potentials.append(float(phi.mean().cpu()))
+        self.policy_elcv.policy.train(); self.policy_rfv.policy.train()
+        if not losses:
+            raise RuntimeError("all discriminator minibatches contained invalid values")
+        # Recover AIRL reward for every accumulated policy transition, as in upstream.
+        for policy, disc in ((self.policy_elcv, self.discriminator_elcv), (self.policy_rfv, self.discriminator_rfv)):
+            data = policy.buffer.tensors()
+            recovered = disc.calculate_reward(data["states"], data["dones"], data["logprobs"], data["next_states"]).squeeze(-1)
+            policy.buffer.rewards = torch.clamp(recovered, -10., 10.).detach().cpu().tolist()
+        return {"discriminator_loss": float(np.mean(losses)),
+                "expert_accuracy_elcv": float(np.mean([a[0] for a in accuracies])),
+                "policy_accuracy_elcv": float(np.mean([a[1] for a in accuracies])),
+                "expert_accuracy_rfv": float(np.mean([a[2] for a in accuracies])),
+                "policy_accuracy_rfv": float(np.mean([a[3] for a in accuracies])),
+                "private_reward": float(np.mean(private_values)), "shared_potential": float(np.mean(potentials)),
+                "alpha_elcv": float(self.discriminator_elcv.alpha.detach().cpu()),
+                "alpha_rfv": float(self.discriminator_rfv.alpha.detach().cpu())}
+
+    def save(self, directory=None):
+        directory = Path(directory) if directory else self.output_dir
+        if directory is None:
+            raise ValueError("output directory is required to save checkpoints")
+        directory.mkdir(parents=True, exist_ok=True)
+        self.policy_elcv.save(directory / "policy_elcv.pt")
+        self.policy_rfv.save(directory / "policy_rfv.pt")
+        torch.save(self.discriminator_elcv.state_dict(), directory / "discriminator_elcv.pt")
+        torch.save(self.discriminator_rfv.state_dict(), directory / "discriminator_rfv.pt")
+        (directory / "config.json").write_text(json.dumps({"algorithm": "SR-AIRL", "srairl": self.config.__dict__,
+            "training": self.train_config.__dict__, "episode": self.episode, "global_steps": self.global_steps}, indent=2))
+
+    @staticmethod
+    def load_policies(directory, config, training_config, device="cpu"):
+        """Restore both actors for evaluation without constructing a discriminator."""
+        state_dim = config.frame_state_dim * config.history_len
+        policies = [PPO(state_dim, 2, training_config.actor_lr, training_config.critic_lr,
+                        config.gamma, training_config.ppo_epochs, training_config.clip_epsilon,
+                        training_config.initial_action_std, device) for _ in range(2)]
+        policies[0].load(Path(directory) / "policy_elcv.pt")
+        policies[1].load(Path(directory) / "policy_rfv.pt")
+        for policy in policies:
+            policy.policy.eval()
+            policy.policy_old.eval()
+        return tuple(policies)
+
+    def train(self, callback=None):
+        history = []
+        for episode in range(self.episode, self.train_config.episodes):
+            tracking_return = self._collect_episode(self.envs[episode % len(self.envs)])
+            metrics = {"episode": episode, "global_steps": self.global_steps, "tracking_return": tracking_return}
+            if episode % self.train_config.discriminator_every_episodes == 0:
+                metrics.update(self._discriminator_update())
+                metrics.update({f"elcv_{k}": v for k,v in self.policy_elcv.update().items()})
+                metrics.update({f"rfv_{k}": v for k,v in self.policy_rfv.update().items()})
+            self.episode = episode + 1
+            history.append(metrics)
+            if callback:
+                keep_going = callback(metrics)
+            else:
+                keep_going = True
+            if self.output_dir and self.episode % self.train_config.discriminator_every_episodes == 0:
+                with (self.output_dir / "metrics.jsonl").open("a") as f:
+                    f.write(json.dumps(metrics, allow_nan=False) + "\n")
+                self.save()
+            if keep_going is False:
+                break
+        if self.output_dir:
+            self.save()
+        return history

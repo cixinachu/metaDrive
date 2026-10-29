@@ -14,11 +14,10 @@ JOB_ROOTS = (MODELS, RESULTS, RUNS)
 def run_root(kind):
     return {'train': MODELS, 'eval': RESULTS, 'preview': RUNS}[kind]
 
-SCENARIOS = {'procedural': ('程序化道路', 3), 'straight': ('直道', 'S'), 'merge': ('汇入', 'r'),
-             'intersection': ('十字路口', 'X'), 't_junction': ('T 字路口', 'T'), 'roundabout': ('环岛', 'O')}
+SCENARIOS = {'straight': ('Highway 直道（训练）', 'S'), 'curve': ('Highway 弯道（迁移）', 'C'), 'merge': ('Highway 汇入（迁移）', 'r')}
 from rl.algorithms import REGISTRY
 ALGORITHM_NAMES = {key: entry.name for key, entry in REGISTRY.items()}
-DEFAULTS = dict(data_source='procedural', dataset_id='', algorithm='sac', scenario='procedural', lane_num=3, traffic_density=.1, horizon=1000,
+DEFAULTS = dict(data_source='procedural', dataset_id='', algorithm='sac', scenario='straight', lane_num=3, traffic_density=.1, horizon=1000,
                 seed_start=1000, num_scenarios=100, seed=0, traffic_seed=43, environment_seed=42,
                 reward_mode='cmdp', cost_mode='continuous', timesteps=100000, learning_rate=.0003,
                 batch_size=256, buffer_size=50000, learning_starts=1000, gamma=.99, tau=.005,
@@ -55,6 +54,8 @@ def clean_request(raw, kind):
             c[key] = int(value)
     if c['data_source']=='procedural' and c['lane_num']>4:
         raise ValueError('程序化场景支持 1–4 车道')
+    if c['data_source']=='procedural' and kind=='train' and c['scenario']!='straight':
+        raise ValueError('正式 Highway 训练只使用直道；弯道和汇入用于迁移评估')
     if type(c['deterministic']) is not bool:
         raise ValueError('deterministic 必须为布尔值')
     if c['batch_size'] > c['buffer_size']:
@@ -77,6 +78,59 @@ def clean_request(raw, kind):
                  horizon=min(c['horizon'],int(math.floor(clip['duration']/.1+1e-6))))
     environment_config(c, kind)
     return c
+
+
+def clean_srairl_request(raw, kind):
+    """Validate the isolated SR-AIRL legacy-kinematic Studio interface."""
+    from datasets.importer import load_clip
+    if kind not in ('train','eval'):
+        raise ValueError('SR-AIRL Studio currently supports training and evaluation, not MetaDrive preview')
+    scenarios=raw.get('srairl_scenarios')
+    if not isinstance(scenarios,list) or not scenarios:
+        raise ValueError('先选择一个已导入的 NGSIM 片段并指定四个车辆角色')
+    if kind=='eval' and len(scenarios)!=1:
+        raise ValueError('一次 SR-AIRL 评估对应一个独立轨迹片段')
+    checked=[]
+    role_keys=('elcv_id','rfv_id','rlv_current_id','rlv_target_id')
+    for item in scenarios:
+        if not isinstance(item,dict) or not isinstance(item.get('roles'),dict):
+            raise ValueError('SR-AIRL 场景必须包含 dataset_id 和 roles')
+        clip,manifest=load_clip(item.get('dataset_id'))
+        required_split='train' if kind=='train' else 'eval'
+        if manifest.get('source')!='ngsim' or manifest.get('split')!=required_split:
+            raise ValueError(f'SR-AIRL {kind} 只能使用 NGSIM {required_split} 数据片段')
+        roles={key:str(item['roles'].get(key,'')).strip() for key in role_keys}
+        if any(not value for value in roles.values()):raise ValueError('ELCV、RFV、当前车道前车和目标车道前车 ID 均须明确填写')
+        available={str(track['id']) for track in clip.get('tracks',[])}
+        missing=sorted(set(roles.values())-available)
+        if missing:raise ValueError(f'片段中找不到车辆轨迹 ID: {missing}')
+        if len(set(roles.values()))!=4:raise ValueError('四个 SR-AIRL 车辆角色必须对应不同轨迹')
+        from env.core.types import InteractionScenario
+        from env.tasks.srairl_env import SRAIRLEnv
+        interaction=InteractionScenario.from_clip(clip,manifest,**roles)
+        SRAIRLEnv(interaction,dynamics_mode='legacy_kinematic')
+        if kind=='train':
+            from datasets.srairl.expert_builder import ExpertDatasetBuilder
+            transitions=ExpertDatasetBuilder().build(interaction)
+            if len(transitions)<4:raise ValueError('SR-AIRL 训练片段至少要含两个时间步的双车专家转移')
+        checked.append({'dataset_id':item['dataset_id'],'roles':roles,'manifest':manifest})
+    episodes=int(raw.get('srairl_episodes',1000))
+    ppo_epochs=int(raw.get('srairl_ppo_epochs',80))
+    seed=int(raw.get('srairl_seed',0))
+    device=raw.get('srairl_device','auto')
+    if not 1<=episodes<=10_000_000 or not 1<=ppo_epochs<=1000 or not 0<=seed<2**32:
+        raise ValueError('SR-AIRL 回合数、PPO epochs 或随机种子超出范围')
+    if device not in ('auto','cpu','cuda'):raise ValueError('SR-AIRL 设备只能是 auto、cpu 或 cuda')
+    if kind=='eval' and not raw.get('srairl_model_id'):raise ValueError('评估时请选择已训练的 SR-AIRL 模型')
+    view_mode=raw.get('srairl_view','topdown')
+    if view_mode not in ('topdown','chase3d','first3d','bird3d'):raise ValueError('SR-AIRL MetaDrive view is invalid')
+    meta_drive_world=raw.get('srairl_metadrive_world',True)
+    if type(meta_drive_world) is not bool:raise ValueError('MetaDrive world selection must be boolean')
+    reactive_background=raw.get('srairl_reactive_background',True)
+    if type(reactive_background) is not bool:raise ValueError('SR-AIRL reactive background selection must be boolean')
+    return {'srairl_scenarios':checked,'episodes':episodes,'ppo_epochs':ppo_epochs,'seed':seed,'device':device,
+            'model_id':str(raw.get('srairl_model_id','')),'task':'srairl','dynamics_mode':'legacy_kinematic',
+            'metadrive_world':meta_drive_world,'srairl_view':view_mode,'srairl_reactive_background':reactive_background}
 
 
 def environment_config(c, kind):

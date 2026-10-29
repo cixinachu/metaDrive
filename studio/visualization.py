@@ -4,9 +4,18 @@ from metadrive.obs.state_obs import LidarStateObservation
 
 
 class StudioEnv(SafeMetaDriveEnv):
-    def __init__(self, research_config, view_mode='topdown'):
+    def __init__(self, research_config, view_mode='topdown', dataset_clip=None, controlled_track_ids=None, reactive_background=False):
         self.view_mode = view_mode
-        super().__init__(research_config=research_config)
+        self.reactive_background=bool(reactive_background)
+        super().__init__(research_config=research_config,dataset_clip=dataset_clip,
+                         controlled_track_ids=controlled_track_ids)
+
+    def setup_engine(self):
+        super().setup_engine()
+        if self.dataset_clip and self.interaction_controlled_ids:
+            from env.recorded_traffic import InteractionTrafficManager
+            self.engine.update_manager("traffic_manager",InteractionTrafficManager(
+                self.dataset_clip,self.interaction_controlled_ids,reactive=self.reactive_background))
 
     def _post_process_config(self, config):
         if self.view_mode != 'topdown':

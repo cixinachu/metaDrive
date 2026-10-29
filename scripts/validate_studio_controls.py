@@ -13,7 +13,7 @@ def wait(j):
   time.sleep(.25)
  raise TimeoutError(j)
 report={}
-for scenario in ('procedural','straight','merge','intersection','t_junction','roundabout'):
+for scenario in ('straight','curve','merge'):
  j=api('/api/jobs',{'kind':'preview','settings':{'scenario':scenario,'seed_start':1000,'num_scenarios':1}})['id']
  d=wait(j);assert d['status']['state']=='completed',d
  img=Image.open(io.BytesIO(urllib.request.urlopen(BASE+'/api/jobs/'+j+'/frame').read()))

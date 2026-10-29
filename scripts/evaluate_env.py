@@ -22,7 +22,7 @@ def arguments(default_policy="random"):
     p.add_argument("--model")
     p.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     p.add_argument("--episodes", type=int, default=100)
-    p.add_argument("--scenario", choices=("procedural", "straight", "merge", "intersection", "t_junction", "roundabout"))
+    p.add_argument("--scenario", choices=("straight", "curve", "merge"))
     p.add_argument("--traffic-density", type=float)
     p.add_argument("--seed-start", type=int)
     p.add_argument("--num-scenarios", type=int)
@@ -38,11 +38,8 @@ def arguments(default_policy="random"):
 
 def resolve_config(args):
     c = load_config(args.config)
-    if args.scenario and args.scenario != "procedural":
+    if args.scenario:
         c = merge_config(c, json.loads((ROOT / f"configs/scenarios/{args.scenario}.yaml").read_text()))
-    elif args.scenario == "procedural":
-        c["environment"]["map"] = load_config()["environment"]["map"]
-        c["scenario"]["type"] = "procedural"
     for arg, group, name in (("traffic_density", "environment", "traffic_density"), ("horizon", "environment", "horizon"),
                              ("seed_start", "scenario", "start_seed"), ("num_scenarios", "scenario", "num_scenarios"),
                              ("traffic_seed", "seeds", "traffic_seed"), ("reward_mode", "environment", "reward_mode"),

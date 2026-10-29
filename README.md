@@ -29,13 +29,13 @@ python studio/server.py --port 6002
 | `outputs/studio/` | 可删除的场景预览缓存；兼容旧实验 |
 | `tests/`、`scripts/` | 回归测试、评估和诊断工具 |
 
-本仓库包含源码，以及 NGSIM 原始表、处理片段、训练模型、实验日志和本地验收产物的完整无损归档。解压后项目约 8.8 GB。数据与实验产物保存在 `archive/` 的分卷文件中，克隆仓库后执行以下命令还原原有目录结构，无需 Git LFS：
+GitHub 仓库当前提供源码、配置和还原工具。此前生成的 NGSIM 原始表、处理片段、训练模型、实验日志和验收产物归档仍保留在本地，分卷尚未上传；仅克隆仓库不会取得这些数据。取得完整 `archive/` 分卷及清单后，可执行以下命令还原原有目录结构，无需 Git LFS。归档解压后约 8.8 GB，代表生成归档时的快照，不自动包含后续实验产物：
 
 ```bash
 python scripts/restore_full_archive.py
 ```
 
-还原脚本会核对每个分卷和每个原始文件的 SHA256；已有相同文件会跳过，已有不同内容的文件默认不覆盖。仅检查归档可加 `--verify-only`。完整文件清单与分卷校验值见 `archive/manifest.json`。`.gitignore` 排除的是解压副本，完整内容已经随归档上传。Python 缓存、临时工具和凭据不纳入版本管理。数据来源和许可见 [数据许可说明](datasets/DATA_LICENSE.md)，处理流程见 [NGSIM 数据说明](docs/DATASETS.md)。
+还原脚本会核对每个分卷和每个原始文件的 SHA256；已有相同文件会跳过，已有不同内容的文件默认不覆盖。仅检查归档可加 `--verify-only`。归档附带的 `archive/manifest.json` 记录完整文件清单与分卷校验值。`.gitignore` 排除的是本地数据和实验产物。Python 缓存、临时工具和凭据不纳入版本管理。数据来源和许可见 [数据许可说明](datasets/DATA_LICENSE.md)，处理流程见 [NGSIM 数据说明](docs/DATASETS.md)。
 
 已保留环境验收的 100k 模型、两种 reward 的 10k 模型，以及用户的 29,475 步直道训练。
 这些模型有不同用途；保留并不意味着安全性能已达标。

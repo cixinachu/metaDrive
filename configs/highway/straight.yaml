@@ -1,0 +1,1 @@
+{"scenario":{"split":"train","start_seed":1000,"num_scenarios":1000,"type":"straight"},"environment":{"map":"S","lane_num":3,"lane_width":3.5,"traffic_density":0.1,"physics_world_step_size":0.02,"decision_repeat":5,"horizon":1000}}

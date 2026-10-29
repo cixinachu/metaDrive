@@ -15,7 +15,8 @@ import time
 import zipfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,atomic_json
+from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,clean_srairl_request,atomic_json
+from tasks.registry import TASK_REGISTRY
 
 from rl.algorithms import metadata as algorithm_metadata
 from datasets.importer import catalog as dataset_catalog, import_clip
@@ -45,6 +46,16 @@ def model_catalog():
         result.append(dict(id=hashlib.sha256(str(p.relative_to(ROOT)).encode()).hexdigest()[:20],
              label=f'{meta.get("algorithm","sac")} · {p.parent.name}/{p.name}',algorithm=meta.get('algorithm','sac'),
              path=str(p.relative_to(ROOT)),bytes=p.stat().st_size,settings=meta.get('settings',{}),environment_config=env))
+    return result
+
+
+def srairl_model_catalog():
+    result=[]
+    for p in sorted((ROOT/'models').glob('*/config.json'),key=lambda p:p.stat().st_mtime,reverse=True):
+        meta=read_json(p,{}) or {}
+        if meta.get('algorithm')!='SR-AIRL' or not (p.parent/'policy_elcv.pt').is_file() or not (p.parent/'policy_rfv.pt').is_file():continue
+        result.append(dict(id=str(p.parent.relative_to(ROOT)),label=f"SR-AIRL · {p.parent.name}",path=str(p.parent.relative_to(ROOT)),
+                           episode=meta.get('episode',0),global_steps=meta.get('global_steps',0)))
     return result
 
 
@@ -83,6 +94,43 @@ def status(directory):
 def start_job(kind,raw):
     global PROCESS,ACTIVE
     if kind not in ('preview','train','eval'):raise ValueError('未知任务类型')
+    task=raw.pop('task','safe_rl')
+    scenario_family=raw.pop('scenario_family',None)
+    scenario_type=raw.pop('scenario_type',None)
+    if scenario_family is not None:
+        if scenario_family not in ('highway','ngsim','highd'):
+            raise ValueError('未知场景来源；请选择 highway、ngsim 或 highd')
+        if scenario_family in ('ngsim','highd'):
+            raw.setdefault('data_source',scenario_family)
+        if scenario_family=='highway':
+            raw.setdefault('data_source','procedural')
+            if scenario_type is not None:
+                raw['scenario']=scenario_type
+    if task not in TASK_REGISTRY:raise ValueError('未知实验任务')
+    descriptor=TASK_REGISTRY[task]
+    if descriptor.status != 'available':raise ValueError(f'{descriptor.label} 尚未具备可运行的完整训练链：{descriptor.description}')
+    if task == 'srairl':
+        c=clean_srairl_request(raw,kind)
+        if kind=='eval':
+            selected=next((m for m in srairl_model_catalog() if m['id']==c['model_id']),None)
+            if selected is None:raise ValueError('请选择存在的 SR-AIRL 模型')
+            c['model_path']=str((ROOT/selected['path']).resolve())
+        with LOCK:
+            if PROCESS is not None and PROCESS.poll() is None:
+                previous=read_json(job_dir(ACTIVE)/'status.json',{})
+                if previous.get('state') in ('completed','stopped','failed'):
+                    try:PROCESS.wait(timeout=5)
+                    except subprocess.TimeoutExpired:raise ValueError('上一个任务正在释放资源，请稍后再试。')
+                else:raise ValueError('已有任务运行中。请先停止或等待完成。')
+            name=f'{time.strftime("%Y%m%d_%H%M%S")}_{kind}_{time.time_ns()%1000000:06d}'
+            directory=run_root(kind)/name;directory.mkdir(parents=True)
+            atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c))
+            atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
+            with (directory/'worker.log').open('w') as log:
+                PROCESS=subprocess.Popen([sys.executable,'-u',str(ROOT/'studio/worker.py'),'--job',str(directory)],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
+            ACTIVE=name
+            return {'id':name}
+    if task != 'safe_rl':raise ValueError('当前任务暂不可由 Studio 启动')
     c=clean_request(raw,kind)
     model=None
     if kind=='eval':
@@ -105,7 +153,7 @@ def start_job(kind,raw):
             else:raise ValueError('已有任务运行中。请先停止或等待完成。')
         name=f'{time.strftime("%Y%m%d_%H%M%S")}_{kind}_{time.time_ns()%1000000:06d}'
         directory=run_root(kind)/name;directory.mkdir(parents=True)
-        atomic_json(directory/'request.json',dict(kind=kind,settings=c,model_path=str(ROOT/model['path']) if model else None))
+        atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c,model_path=str(ROOT/model['path']) if model else None))
         atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
         with (directory/'worker.log').open('w') as log:
             PROCESS=subprocess.Popen([sys.executable,'-u',str(ROOT/'studio/worker.py'),'--job',str(directory)],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
@@ -134,12 +182,17 @@ class Handler(BaseHTTPRequestHandler):
     def get(self):
         parsed=urlparse(self.path);path=parsed.path;q=parse_qs(parsed.query)
         if path=='/api/catalog':
-            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),datasets=dataset_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{})))
+            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),datasets=dataset_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{})))
         if path=='/api/jobs':
             jobs=[]
             for p in sorted((p for root in JOB_ROOTS for p in root.glob('*') if p.is_dir() and (p/'request.json').exists()),key=lambda p:p.name,reverse=True):
                 if p.is_dir():jobs.append(dict(id=p.name,request=read_json(p/'request.json',{}),status=status(p)))
             return self.respond(dict(active=ACTIVE,jobs=jobs))
+        if path.startswith('/api/datasets/') and path.endswith('/tracks'):
+            identifier=path.split('/')[3]
+            from datasets.importer import load_clip
+            clip,manifest=load_clip(identifier)
+            return self.respond(dict(id=identifier,source=manifest['source'],split=manifest['split'],tracks=[dict(id=str(t['id']),ego=bool(t.get('ego')),states=len(t.get('states',[]))) for t in clip.get('tracks',[])]))
         if path.startswith('/api/jobs/'):
             parts=path.split('/');directory=job_dir(parts[3]);action=parts[4] if len(parts)>4 else ''
             if action=='frame':
@@ -194,7 +247,11 @@ class Handler(BaseHTTPRequestHandler):
             if self.path=='/api/datasets/import':
                 with LOCK:
                     return self.respond(import_clip(raw))
-            if self.path=='/api/jobs':return self.respond(start_job(raw['kind'],raw['settings']))
+            if self.path=='/api/jobs':
+                settings=dict(raw['settings'])
+                for key in ('task','scenario_family','scenario_type'):
+                    if key in raw:settings[key]=raw[key]
+                return self.respond(start_job(raw['kind'],settings))
             if self.path.startswith('/api/jobs/') and self.path.endswith('/stop'):
                 directory=job_dir(self.path.split('/')[3]);(directory/'STOP').touch()
                 return self.respond({'ok':True,'message':'将在当前步骤结束后保存模型并停止'})

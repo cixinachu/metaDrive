@@ -258,28 +258,24 @@ out-of-road 采用原生判定：不在可用车道上，或接触有效连续�
 
 ## 8. Scenario generation 和 train/test split
 
-训练默认 `map=3`、3 个车道、lane width=3.5 m、exit_length=50 m，采用原生 V2 procedural
-block distribution：Curve 0.30、Straight 0.10、InRampOnStraight 0.10、OutRampOnStraight 0.10、
-StdInterSection 0.15、StdTInterSection 0.15、Roundabout 0.10。每张地图不要求同时包含全部类型，
-这些道路类型在训练地图族中有正采样概率。
+当前正式 Highway 主实验与 MetaDrive 原生默认 `map=3` 的混合拓扑分布区分开：
+
+- 训练：Highway Straight (`map="S"`)，默认 3 车道、3.5 m 车道宽、交通密度 0.10；
+- 迁移评估：Highway Curve (`map="C"`) 和 Highway Merge (`map="r"`)；
+- Intersection、T-junction、Roundabout 保留为辅助地图，不进入当前 Highway 训练主分布。
+
+控制周期仍为 `0.02 × 5 = 0.1 s`，训练时域默认 1000 步。平台基础配置默认 `map="S"`；Studio 只将直道作为正式训练场景，弯道与汇入用于评估迁移。
 
 训练保留范围由 `configs/env/train.yaml` 定义：1000–1999；默认 ID test 为 0–199。
 配置校验禁止测试集合与保留训练区间重叠；显式 reset(seed=...) 也必须属于本环境配置范围。
-大于等于 2000 的额外测试 seeds 可通过 CLI 指定，不代表已经做过分布偏移有效性验证。
 
-| Diagnostic config | Actual block class / code |
-|---|---|
-| `straight.yaml` | Straight / `S` |
-| `merge.yaml` | InRampOnStraight / `r` |
-| `intersection.yaml` | StdInterSection / `X` |
-| `t_junction.yaml` | StdTInterSection / `T` |
-| `roundabout.yaml` | Roundabout / `O` |
+| Formal Highway scene | MetaDrive map code | Use |
+|---|---|---|
+| Straight | `S` | training |
+| Curve | `C` | transfer evaluation |
+| Merge | `r` | transfer evaluation |
 
-代码已经与安装版本类定义核对。最终诊断配置默认固定 seed=0、num_scenarios=1，
-形成五个可重复的固定测试场景。需要同拓扑的更多变体时，CLI 可显式覆盖 seed 范围。
-这不是训练五个 policy；同一个 checkpoint 在所有诊断环境中复用。
-直线配置提供可出现跟车的动态道路，不是强制注入某条预定轨迹的 car-following 测试；
-cut-in 等几何风险另由受控单元测试覆盖。
+辅助路口配置仍在 `configs/scenarios/` 下单独保留，不属于上述三个主实验场景。
 
 ## 9. Traffic
 
