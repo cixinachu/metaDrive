@@ -56,7 +56,11 @@ def srairl_model_catalog():
         if meta.get('algorithm')!='SR-AIRL' or not (p.parent/'policy_elcv.pt').is_file() or not (p.parent/'policy_rfv.pt').is_file():continue
         result.append(dict(id=str(p.parent.relative_to(ROOT)),label=f"SR-AIRL · {p.parent.name}",path=str(p.parent.relative_to(ROOT)),
                            episode=meta.get('episode',0),global_steps=meta.get('global_steps',0),
-                           dynamics_mode=meta.get('dynamics_mode','legacy_kinematic')))
+                           dynamics_mode=meta.get('dynamics_mode','legacy_kinematic'),
+                           scene_source=meta.get('scene_source','ngsim'),scenario=meta.get('scenario','straight'),
+                           lane_num=meta.get('lane_num'),traffic_density=meta.get('traffic_density'),horizon=meta.get('horizon'),
+                           interaction_scenario=meta.get('interaction_scenario'),
+                           initialization_protocol=meta.get('initialization_protocol','canonical')))
     return result
 
 
@@ -235,7 +239,8 @@ class Handler(BaseHTTPRequestHandler):
     def get(self):
         parsed=urlparse(self.path);path=parsed.path;q=parse_qs(parsed.query)
         if path=='/api/catalog':
-            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_expert_datasets=srairl_expert_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{})))
+            calibration=read_json(ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',{})
+            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_expert_datasets=srairl_expert_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{}),srairl_action_calibration=calibration))
         if path=='/api/datasets/catalog':
             return self.respond(dataset_catalog())
         if path=='/api/jobs':

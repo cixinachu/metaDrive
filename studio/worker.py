@@ -323,6 +323,7 @@ def evaluate(directory,c,env_config,model_path):
 
 def build_srairl_scenarios(c, required_split):
     from env.core.types import InteractionScenario
+    from datasets.srairl.interaction_validator import validate_interaction_scenario
     from datasets.importer import load_clip
     scenarios=[]
     for row in c['srairl_scenarios']:
@@ -330,6 +331,9 @@ def build_srairl_scenarios(c, required_split):
         if manifest['split']!=required_split:
             raise ValueError(f"SR-AIRL requires {required_split} clips, got {manifest['split']}")
         scenario=InteractionScenario.from_clip(clip,manifest,**row['roles'])
+        scenario_validation=validate_interaction_scenario(scenario)
+        if not scenario_validation['valid']:
+            raise ValueError(f"invalid SR-AIRL interaction clip {scenario.scenario_id}: {scenario_validation['errors']}")
         scenarios.append(scenario)
     return scenarios
 
@@ -362,12 +366,32 @@ def create_srairl_metadrive_world(scenario,split,view_mode='topdown',reactive_ba
                      reactive_background=reactive_background)
 
 
+def load_srairl_initial_state_samples(c):
+    if c.get('initialization_protocol')!='ngsim_distribution':return []
+    from datasets.importer import load_clip
+    from datasets.srairl.interaction_validator import extract_initial_state_distribution
+    from env.core.types import InteractionScenario
+    samples=[]
+    for item in c.get('srairl_scenarios',[]):
+        clip,manifest=load_clip(item['dataset_id'])
+        source=InteractionScenario.from_clip(clip,manifest,**item['roles'])
+        for sample in extract_initial_state_distribution(source,samples=5,window_s=2.):
+            samples.append({**sample,'dataset_id':item['dataset_id'],
+                'recording_group':manifest.get('recording_group'),'clip_sha256':manifest.get('clip_sha256')})
+    if not samples:raise ValueError('Selected NGSIM clip has no supported pre-change initial states')
+    return samples
+
+
 def build_srairl_envs(scenarios,c,config):
     from env.tasks.srairl_env import SRAIRLEnv
     if c.get('scene_source','ngsim')=='procedural':
         from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+        from env.tasks.srairl_interaction import SRAIRLInteractionScenario
+        initial_state_samples=load_srairl_initial_state_samples(c)
         return [SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c.get('scene_seed',c['seed']),
-            c['horizon'],c.get('srairl_view','topdown'),config=config,traffic_seed=c.get('traffic_seed'))]
+            c['horizon'],c.get('srairl_view','topdown'),config=config,traffic_seed=c.get('traffic_seed'),
+            interaction_scenario=SRAIRLInteractionScenario(**c.get('interaction_scenario',{})),
+            rfv_response=c.get('rfv_response','policy'),initial_state_samples=initial_state_samples)]
     envs=[]
     for scenario in scenarios:
         world=create_srairl_metadrive_world(scenario,'train' if scenario.split=='train' else 'eval',c.get('srairl_view','topdown'),
@@ -380,17 +404,27 @@ def save_srairl_input_manifest(directory,c):
     rows=[]
     if c.get('srairl_scenarios'):
         from datasets.importer import load_clip
+        from env.core.types import InteractionScenario
+        from datasets.srairl.interaction_validator import validate_interaction_scenario
         for item in c['srairl_scenarios']:
-            _,manifest=load_clip(item['dataset_id'])
-            rows.append({'dataset_id':item['dataset_id'],'clip_sha256':manifest['clip_sha256'],
+            clip,manifest=load_clip(item['dataset_id'])
+            scenario=InteractionScenario.from_clip(clip,manifest,**item['roles'])
+            validation=validate_interaction_scenario(scenario)
+            row={'dataset_id':item['dataset_id'],'clip_sha256':manifest['clip_sha256'],
                          'source_sha256':manifest.get('source_sha256'), 'source':manifest['source'],
                          'split':manifest['split'],'recording_group':manifest.get('recording_group'),
-                         'roles':item['roles']})
+                         'roles':item['roles'],'interaction_validation':validation}
+            if c.get('initialization_protocol')=='ngsim_distribution':
+                from datasets.srairl.interaction_validator import extract_initial_state_distribution
+                row['initial_state_distribution']=extract_initial_state_distribution(scenario,samples=5,window_s=2.)
+            rows.append(row)
     atomic_json(directory/'dataset_manifest.json',{'task':'SR-AIRL','dynamics_mode':c.get('dynamics_mode','legacy_kinematic'),'metadrive_world':bool(c.get('metadrive_world',True)),
         'scene_seed':c.get('scene_seed',c.get('seed')),'traffic_seed':c.get('traffic_seed'),'rl_seed':c.get('rl_seed',c.get('seed')),
         'reactive_background':bool(c.get('srairl_reactive_background',False)),
         'scene_source':c.get('scene_source','ngsim'),'scenario':c.get('scenario','straight'),
         'lane_num':c.get('lane_num'),'traffic_density':c.get('traffic_density'),
+        'initialization_protocol':c.get('initialization_protocol','canonical'),
+        'interaction_scenario':c.get('interaction_scenario'),'rfv_response':c.get('rfv_response','policy'),
         'expert_dataset_id':c.get('expert_dataset_id'),
         'expert_ngsim_scenarios':rows})
 
@@ -433,6 +467,12 @@ def train_srairl(directory,c):
         saved['reactive_background']=bool(c.get('srairl_reactive_background',False))
         saved['scene_source']=c.get('scene_source','ngsim');saved['scenario']=c.get('scenario','straight')
         saved['lane_num']=c.get('lane_num');saved['traffic_density']=c.get('traffic_density');saved['horizon']=c.get('horizon')
+        saved['interaction_scenario']=c.get('interaction_scenario');saved['rfv_response']=c.get('rfv_response','policy')
+        saved['initialization_protocol']=c.get('initialization_protocol','canonical')
+        saved['initial_state_samples']=[{k:v for k,v in row.items() if k in ('time_s','elcv_rfv_gap_m',
+            'rlv_current_gap_m','rlv_target_gap_m','elcv_speed_mps','rfv_speed_mps',
+            'rlv_current_speed_mps','rlv_target_speed_mps','source_lane','target_lane','dataset_id',
+            'recording_group','clip_sha256')} for row in getattr(envs[0],'initial_state_samples',[])]
         atomic_json(directory/'config.json',saved)
         state='stopped' if (directory/'STOP').exists() else 'completed'
         summary=dict(algorithm='SR-AIRL',episodes=trainer.episode,global_steps=trainer.global_steps,
@@ -441,6 +481,8 @@ def train_srairl(directory,c):
                      expert_dataset_id=c.get('expert_dataset_id'),
                      scene_source=c.get('scene_source','ngsim'),scenario=c.get('scenario','straight'),
                      lane_num=c.get('lane_num'),traffic_density=c.get('traffic_density'),
+                     initialization_protocol=c.get('initialization_protocol','canonical'),
+                     initial_state_sample_count=len(getattr(envs[0],'initial_state_samples',[])),
                      background_traffic_count=(envs[0]._last_info.get('traffic_vehicle_count') if hasattr(envs[0],'_last_info') else None),
                      dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
                      reactive_background=bool(c.get('srairl_reactive_background',False)),checkpoint=str(directory.relative_to(ROOT)))
@@ -457,8 +499,10 @@ def collect_srairl_expert(directory,c):
     from datasets.srairl.expert_builder import save_transitions
     from datasets.srairl.metadrive_expert import collect_metadrive_expert
     from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+    from env.tasks.srairl_interaction import SRAIRLInteractionScenario
     env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c.get('scene_seed',c['seed']),
-        c['horizon'],c['srairl_view'],traffic_seed=c.get('traffic_seed'))
+        c['horizon'],c['srairl_view'],traffic_seed=c.get('traffic_seed'),
+        interaction_scenario=SRAIRLInteractionScenario(**c.get('interaction_scenario',{})))
     recorder=Recorder(directory)
     try:
         def report(state):
@@ -468,7 +512,11 @@ def collect_srairl_expert(directory,c):
                     'demo/speed_rfv_mps':float(env.world.role_vehicle('rfv').speed),
                     'demo/distance_travelled_m':float(info.get('distance_travelled_m',0.)),
                     'demo/collision':float(info.get('metadrive_primary_collision',False)),
-                    'demo/offroad':float(info.get('metadrive_out_of_road',False))},
+                    'demo/offroad':float(info.get('metadrive_out_of_road',False)),
+                    'demo/lane_change_started':float(info.get('lane_change_started',False)),
+                    'demo/lane_change_completed':float(info.get('lane_change_completed',False)),
+                    'demo/target_gap_m':float(info.get('target_gap_m',0.)),
+                    'demo/delta_v_rfv_mps':float(info.get('delta_v_rfv_mps',0.))},
                     step=int(state.get('global_steps',0)))
             atomic_json(directory/'status.json',state)
             return not (directory/'STOP').exists()
@@ -478,8 +526,10 @@ def collect_srairl_expert(directory,c):
         pair_count=save_transitions(saved_dataset,transitions,dict(source='MetaDrive',scene_source='procedural',
             scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
             horizon=c['horizon'],seed=c['seed'],episodes=len(episodes),controller=c['expert_controller'],
+            interaction_scenario=c.get('interaction_scenario'),
             state_definition='SRAIRLObservationAdapter 16D frame stacked HISTORY_LEN times; action=[longitudinal_acceleration,lateral_acceleration] in m/s^2',
-            dynamics_mode='metadrive_physics',background_traffic='MetaDrive IDM traffic manager'))
+            dynamics_mode='metadrive_physics',background_traffic='MetaDrive IDM traffic manager',
+            interaction_template='ELCV moves from source lane into the gap between RFV and RLV_target; RFV follows its leader and may respond'))
         import shutil
         shutil.copy2(saved_dataset,dataset_path)
         with (directory/'episodes.jsonl').open('a') as f:
@@ -487,8 +537,9 @@ def collect_srairl_expert(directory,c):
         summary=dict(task='srairl_expert_collection',source='MetaDrive',scene_source='procedural',
             scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
             horizon=c['horizon'],seed=c['seed'],episodes=len(episodes),transition_pairs=pair_count,
+            interaction_scenario=c.get('interaction_scenario'),
             transitions=len(transitions),expert_controller=c['expert_controller'],
-            controller_interpretation='Rule-based headway and lane-keeping teacher; a scripted demonstration source, not an optimal or human expert.',
+            controller_interpretation='Rule-based ELCV gap acceptance and RFV headway-response teacher; a scripted demonstration source, not an optimal or human expert.',
             background_traffic='MetaDrive IDM traffic manager',dataset_file='expert_transitions.npz',
             reusable_dataset=str(saved_dataset.relative_to(ROOT)),
             dynamics_mode='metadrive_physics')
@@ -503,8 +554,10 @@ def collect_srairl_expert(directory,c):
 def evaluate_srairl_procedural(directory,c,env,policies,training):
     """Evaluate the learned ELCV/RFV pair on a generated MetaDrive map."""
     device=policies[0].device
-    recorder=Recorder(directory);steps=0;episode_return=0.;min_distance=float('inf')
+    recorder=Recorder(directory);steps=0;episode_return=0.;min_distance=float('inf');min_ttc=float('inf')
     collision=False;out_of_road=False;done=False;obs,_=env.reset(seed=c['seed']);info=env._last_info
+    lane_change_started=False;lane_change_completed=False;rfv_delta_v=0.;rfv_min_accel=0.
+    gap_start=float(env._initial_gap);gap_final=gap_start;lane_change_time=None
     video=EpisodeVideo(directory,1)
     try:
         video.write(render_srairl_frame(directory,env,info))
@@ -517,13 +570,23 @@ def evaluate_srairl_procedural(directory,c,env,policies,training):
             video.write(render_srairl_frame(directory,env,info))
             steps+=1;episode_return+=float(info['tracking_reward'])
             if info['minimum_distance_m'] is not None:min_distance=min(min_distance,float(info['minimum_distance_m']))
+            if info.get('minimum_ttc_s') is not None:min_ttc=min(min_ttc,float(info['minimum_ttc_s']))
             collision|=bool(info['metadrive_primary_collision']);out_of_road|=bool(info['metadrive_out_of_road'])
+            lane_change_started|=bool(info['lane_change_started']);lane_change_completed|=bool(info['lane_change_completed'])
+            rfv_delta_v=float(np.linalg.norm(env.world.role_vehicle('rfv').velocity)-env._rfv_initial_speed)
+            rfv_min_accel=min(rfv_min_accel,float(info['rfv_min_accel_mps2']))
+            gap_final=float(info['target_gap_m']);lane_change_time=info.get('time_to_lane_change')
             done=bool(info['done'])
             recorder.write({'step/progress_reward':float(info['tracking_reward']),
                 'step/minimum_vehicle_distance_m':float(info['minimum_distance_m'] or 0.),
                 'step/distance_travelled_m':float(info['distance_travelled_m']),
                 'step/collision':float(info['metadrive_primary_collision']),
-                'step/out_of_road':float(info['metadrive_out_of_road'])},step=steps)
+                'step/out_of_road':float(info['metadrive_out_of_road']),
+                'step/lane_change_started':float(info['lane_change_started']),
+                'step/lane_change_completed':float(info['lane_change_completed']),
+                'step/target_gap_m':float(info['target_gap_m']),
+                'step/rfv_delta_v_mps':float(rfv_delta_v),
+                **({'step/min_ttc_s':float(info['minimum_ttc_s'])} if info.get('minimum_ttc_s') is not None else {})},step=steps)
             atomic_json(directory/'status.json',dict(state='running',kind='eval',step=steps,total=c['horizon'],
                 episodes=0,global_steps=steps,dynamics_mode='metadrive_physics',device=str(device),
                 scene_source='procedural',scenario=c['scenario'],traffic_vehicle_count=info['traffic_vehicle_count']))
@@ -531,24 +594,65 @@ def evaluate_srairl_procedural(directory,c,env,policies,training):
         row=dict(episode=1,scenario_id=f"metadrive-{c['scenario']}",scene_source='procedural',
             map=c['scenario'],steps=steps,progress_return=episode_return,
             distance_travelled_m=float(info['distance_travelled_m']),minimum_distance_m=None if not np.isfinite(min_distance) else min_distance,
+            minimum_ttc_s=None if not np.isfinite(min_ttc) else min_ttc,
             collision=bool(collision),out_of_road=bool(out_of_road),
             survival_success=bool(completed and not collision and not out_of_road),
+            success=bool(completed and info.get('merge_success',False) and not collision and not out_of_road),
+            route_completion=float(info.get('route_completion',0.)),
+            initialization_protocol=info.get('initialization_protocol','canonical'),
+            initial_state_time_s=info.get('initial_state_time_s'),
+            initial_state_dataset_id=info.get('initial_state_dataset_id'),
             traffic_vehicle_count=int(info['traffic_vehicle_count']),lane_num=c['lane_num'],
-            traffic_density=c['traffic_density'],dynamics_mode='metadrive_physics')
+            traffic_density=c['traffic_density'],dynamics_mode='metadrive_physics',
+            lane_change_started=lane_change_started,lane_change_completed=lane_change_completed,
+            merge_success=bool(info.get('merge_success',False) and not collision and not out_of_road),
+            time_to_lane_change_s=lane_change_time,initial_target_gap_m=gap_start,
+            final_target_gap_m=gap_final,target_gap_change_m=gap_final-gap_start,
+            delta_v_rfv_mps=rfv_delta_v,rfv_min_accel_mps2=rfv_min_accel,
+            rfv_response=c.get('rfv_response','policy'))
         if completed:
             with (directory/'episodes.jsonl').open('a') as f:f.write(json.dumps(row,allow_nan=False)+'\n')
             recorder.write({'evaluation/progress_return':episode_return,'evaluation/distance_travelled_m':row['distance_travelled_m'],
                 'evaluation/collision_rate':float(collision),'evaluation/out_of_road_rate':float(out_of_road),
                 'evaluation/survival_success_rate':float(row['survival_success']),
-                **({'evaluation/minimum_distance_m':row['minimum_distance_m']} if row['minimum_distance_m'] is not None else {})},step=steps)
+                'evaluation/success_rate':float(row['success']),
+                'evaluation/route_completion':float(row['route_completion']),
+                'evaluation/lane_change_success_rate':float(row['merge_success']),
+                'evaluation/merge_success_rate':float(row['merge_success']),
+                'evaluation/target_gap_change_m':float(row['target_gap_change_m']),
+                'evaluation/delta_v_rfv_mps':float(row['delta_v_rfv_mps']),
+                **({'evaluation/minimum_distance_m':row['minimum_distance_m']} if row['minimum_distance_m'] is not None else {}),
+                **({'evaluation/minimum_ttc_s':row['minimum_ttc_s']} if row['minimum_ttc_s'] is not None else {})},step=steps)
+        calibration_path=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json'
+        calibration=json.loads(calibration_path.read_text()) if calibration_path.is_file() else None
+        calibration_passed=bool(calibration and calibration.get('equivalence_status')=='passed')
         summary=dict(algorithm='SR-AIRL',episodes=int(completed),global_steps=steps,
             scene_source='procedural',scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
+            initialization_protocol=c.get('initialization_protocol','canonical'),
+            initial_state_time_s=row.get('initial_state_time_s'),
+            initial_state_dataset_id=row.get('initial_state_dataset_id'),
             background_traffic_count=row['traffic_vehicle_count'],dynamics_mode='metadrive_physics',
             progress_return=episode_return if completed else None,distance_travelled_m=row['distance_travelled_m'] if completed else None,
             collision_rate=float(collision) if completed else None,out_of_road_rate=float(out_of_road) if completed else None,
             survival_success_rate=float(row['survival_success']) if completed else None,
+            success_rate=float(row['success']) if completed else None,
+            route_completion=float(row['route_completion']) if completed else None,
             minimum_distance_m=row['minimum_distance_m'] if completed else None,
-            interpretation='Two SR-AIRL policy actors were evaluated on a generated MetaDrive map with simulator traffic. Background vehicles are traffic policies, not additional SR-AIRL learned actors; this is cross-map evaluation, not NGSIM trajectory tracking.')
+            minimum_ttc_s=row['minimum_ttc_s'] if completed else None,
+            lane_change_started=lane_change_started,lane_change_completed=lane_change_completed,
+            lane_change_success_rate=float(row['merge_success']) if completed else None,
+            merge_success_rate=float(row['merge_success']) if completed else None,
+            time_to_lane_change_s=lane_change_time,initial_target_gap_m=gap_start,final_target_gap_m=gap_final,
+            target_gap_change_m=gap_final-gap_start,delta_v_rfv_mps=rfv_delta_v,rfv_min_accel_mps2=rfv_min_accel,
+            rfv_response=c.get('rfv_response','policy'),action_calibration=calibration,
+            merge_route=(dict(elcv_initial_road='ramp: 1r1_2_ → 1r1_3_',
+                rfv_initial_road='mainline: >>> → 1r0_0_',target_mainline_lane_index=2,
+                downstream_route_shared=bool(info.get('merge_route_valid'))) if c['scenario']=='merge' else None),
+            quantitative_transfer_evaluation_allowed=calibration_passed,
+            experiment_status='quantitative' if calibration_passed else 'exploratory_only',
+            interpretation=('Four-role lane-change interaction evaluation: ELCV, RFV, RLV_current and RLV_target are explicit; '
+                'the two leader trajectories are fixed-speed and only the ELCV/RFV are policy controlled. '
+                +('Action calibration passed.' if calibration_passed else 'Action calibration failed or is missing; MetaDrive physics results are exploratory only.')))
         atomic_json(directory/'summary.json',summary)
         return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='eval',step=steps,
                     total=c['horizon'],episodes=int(completed),global_steps=steps,device=str(device))
@@ -573,8 +677,12 @@ def evaluate_srairl(directory,c):
     policies=SRAIRLTrainer.load_policies(path,config,training,device=c['device'] if c['device']!='auto' else ('cuda' if torch.cuda.is_available() else 'cpu'))
     if c.get('scene_source')=='procedural':
         from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+        from env.tasks.srairl_interaction import SRAIRLInteractionScenario
         env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c.get('scene_seed',c['seed']),
-            c['horizon'],c.get('srairl_view','topdown'),config=config,traffic_seed=c.get('traffic_seed'))
+            c['horizon'],c.get('srairl_view','topdown'),config=config,traffic_seed=c.get('traffic_seed'),
+            interaction_scenario=SRAIRLInteractionScenario(**c.get('interaction_scenario',{})),
+            rfv_response=c.get('rfv_response','policy'),
+            initial_state_samples=load_srairl_initial_state_samples(c))
         save_srairl_input_manifest(directory,c);return evaluate_srairl_procedural(directory,c,env,policies,training)
     scenarios=build_srairl_scenarios(c,'eval')
     save_srairl_input_manifest(directory,c)
@@ -634,6 +742,10 @@ def evaluate_srairl(directory,c):
                             'evaluation/metadrive_out_of_road_rate':float(metadrive_out_of_road),
                             'evaluation/success_rate':float(row['success'])},step=steps)
             if row['minimum_ttc_s'] is not None:recorder.write({'evaluation/minimum_ttc_s':row['minimum_ttc_s']},step=steps)
+        calibration_path=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json'
+        calibration=json.loads(calibration_path.read_text()) if calibration_path.is_file() else None
+        calibration_passed=bool(calibration and calibration.get('equivalence_status')=='passed')
+        physics_mode=c.get('dynamics_mode')=='metadrive_physics'
         summary=dict(algorithm='SR-AIRL',episodes=len(episode_rows),global_steps=steps,
                      tracking_return=returns if episode_rows else None,
                      mean_position_error_m=float(np.mean(errors)) if errors else None,
@@ -647,9 +759,12 @@ def evaluate_srairl(directory,c):
                      success_rate=float(episode_rows[0]['success']) if episode_rows else None,
                      scenario_id=scenario.scenario_id,dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
                      traffic_reactive=bool(c.get('srairl_reactive_background',True)),collision_metric='axis_aligned_proxy',
+                     action_calibration=calibration if physics_mode else None,
+                     quantitative_transfer_evaluation_allowed=bool(physics_mode and calibration_passed),
+                     experiment_status=('quantitative' if calibration_passed else 'exploratory_only') if physics_mode else 'ngsim_trajectory_reproduction',
                      background_dynamics='bounded IDM-like longitudinal response around recorded NGSIM reference; not calibrated human-driver dynamics',
-                     result_interpretation=('Both SR-AIRL actors use MetaDrive vehicle physics; the acceleration-to-control mapping is calibrated only around 10 m/s, and the background response model is not fitted to human-driver data.'
-                         if c.get('dynamics_mode')=='metadrive_physics' else
+                     result_interpretation=(('Both SR-AIRL actors use MetaDrive vehicle physics. '+('Full-grid action calibration passed.' if calibration_passed else 'Action calibration failed or is missing; these results are exploratory only. ')+ 'Background response is not fitted to human-driver data.')
+                         if physics_mode else
                          'MetaDrive NGSIM reconstruction with policy-controlled upstream kinematic actors and reactive background replay; not vehicle-physics closed loop.'))
         atomic_json(directory/'summary.json',summary)
         return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='eval',step=steps,total=steps,

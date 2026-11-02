@@ -283,8 +283,15 @@ class SRAIRLTrainer:
     def train(self, callback=None):
         history = []
         for episode in range(self.episode, self.train_config.episodes):
-            tracking_return = self._collect_episode(self.envs[episode % len(self.envs)])
+            env=self.envs[episode % len(self.envs)]
+            tracking_return = self._collect_episode(env)
             metrics = {"episode": episode, "global_steps": self.global_steps, "tracking_return": tracking_return}
+            sample=getattr(env,'current_initial_state',None)
+            if sample:
+                metrics.update({f"initial_state_{key}":value for key,value in sample.items()
+                                if isinstance(value,(int,float,np.number)) and not isinstance(value,bool)})
+                metrics['initial_state_dataset_id']=sample.get('dataset_id')
+                metrics['initial_state_recording_group']=sample.get('recording_group')
             if episode % self.train_config.discriminator_every_episodes == 0:
                 metrics.update(self._discriminator_update())
                 metrics.update({f"elcv_{k}": v for k,v in self.policy_elcv.update().items()})
