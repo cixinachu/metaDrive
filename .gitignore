@@ -2,7 +2,7 @@ __pycache__/
 *.py[cod]
 .local/
 
-# Local data and experiment artifacts; the separate local archive is not yet published.
+# Extracted data and experiment artifacts; the complete snapshot is published in archive/.
 /datasets/raw/
 /datasets/processed/
 /models/
