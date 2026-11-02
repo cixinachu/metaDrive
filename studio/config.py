@@ -103,7 +103,8 @@ def clean_srairl_request(raw, kind):
         if view_mode not in ('topdown','chase3d','first3d','bird3d'):raise ValueError('MetaDrive 画面视角无效')
         return {'task':'srairl','operation':operation,'scene_source':'procedural','scenario':scenario_type,
             'lane_num':lane_num,'traffic_density':float(density),'horizon':horizon,'demo_episodes':episodes,
-            'seed':seed,'device':'cpu','srairl_view':view_mode,'dynamics_mode':'metadrive_physics',
+            'seed':seed,'scene_seed':seed,'traffic_seed':(seed+1_000_003)%(2**32),'rl_seed':seed,
+            'device':'cpu','srairl_view':view_mode,'dynamics_mode':'metadrive_physics',
             'expert_controller':'headway_lane_keeper_v1'}
     scene_source=raw.get('srairl_scene_source','ngsim')
     if scene_source not in ('ngsim','procedural'):
@@ -163,18 +164,23 @@ def clean_srairl_request(raw, kind):
     episodes=int(raw.get('srairl_episodes',1000))
     ppo_epochs=int(raw.get('srairl_ppo_epochs',80))
     seed=int(raw.get('srairl_seed',0))
+    scene_seed=int(raw.get('srairl_scene_seed',seed))
+    traffic_seed=int(raw.get('srairl_traffic_seed',(seed+1_000_003)%(2**32)))
+    rl_seed=int(raw.get('srairl_rl_seed',seed))
     device=raw.get('srairl_device','auto')
     if not 1<=episodes<=10_000_000 or not 1<=ppo_epochs<=1000 or not 0<=seed<2**32:
         raise ValueError('SR-AIRL 回合数、PPO epochs 或随机种子超出范围')
+    if any(not 0<=value<2**32 for value in (scene_seed,traffic_seed,rl_seed)):
+        raise ValueError('SR-AIRL scene/traffic/RL seeds must be in [0, 2^32)')
     if device not in ('auto','cpu','cuda'):raise ValueError('SR-AIRL 设备只能是 auto、cpu 或 cuda')
     if kind=='eval' and not raw.get('srairl_model_id'):raise ValueError('评估时请选择已训练的 SR-AIRL 模型')
     view_mode=raw.get('srairl_view','topdown')
     if view_mode not in ('topdown','chase3d','first3d','bird3d'):raise ValueError('SR-AIRL MetaDrive view is invalid')
     meta_drive_world=raw.get('srairl_metadrive_world',True)
     if type(meta_drive_world) is not bool:raise ValueError('MetaDrive world selection must be boolean')
-    reactive_background=raw.get('srairl_reactive_background',True)
+    reactive_background=raw.get('srairl_reactive_background',False)
     if type(reactive_background) is not bool:raise ValueError('SR-AIRL reactive background selection must be boolean')
-    dynamics_mode=raw.get('srairl_dynamics_mode','metadrive_physics')
+    dynamics_mode=raw.get('srairl_dynamics_mode','legacy_kinematic')
     if dynamics_mode not in ('metadrive_physics','legacy_kinematic'):
         raise ValueError('SR-AIRL dynamics must be MetaDrive physics or upstream kinematics')
     if dynamics_mode=='metadrive_physics' and not meta_drive_world:
@@ -202,7 +208,8 @@ def clean_srairl_request(raw, kind):
             'operation':operation,
             'metadrive_world':meta_drive_world,'srairl_view':view_mode,'srairl_reactive_background':reactive_background,
             'scene_source':scene_source,'scenario':scenario_type,'lane_num':lane_num,
-            'traffic_density':float(density),'horizon':horizon}
+            'traffic_density':float(density),'horizon':horizon,'scene_seed':scene_seed,
+            'traffic_seed':traffic_seed,'rl_seed':rl_seed}
 
 
 def clean_reward_guide_request(raw, kind):

@@ -1,0 +1,8 @@
+{
+  "action_adapter": {
+    "wheelbase_m": 2.7,
+    "max_steering_angle_rad": 0.7,
+    "throttle_accel_mps2": 2.35,
+    "brake_accel_mps2": 12.5
+  }
+}

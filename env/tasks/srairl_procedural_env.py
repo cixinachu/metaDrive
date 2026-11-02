@@ -15,7 +15,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
     """
 
     def __init__(self, scenario_type="straight", lane_num=3, traffic_density=.15,
-                 seed=0, horizon=1000, view_mode="topdown", config=None):
+                 seed=0, horizon=1000, view_mode="topdown", config=None, traffic_seed=None):
         self.scenario_type=scenario_type
         self.scene_source="procedural"
         self.max_steps=int(horizon)
@@ -26,7 +26,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         tracks={str(i):{"id":str(i),"length":4.5,"width":1.8,"states":states.copy()} for i in range(4)}
         placeholder=SimpleNamespace(scenario_id=f"metadrive-{scenario_type}",elcv_id="0",rfv_id="1",
             rlv_current_id="2",rlv_target_id="3",tracks=tracks,start_time=0.,end_time=(self.max_steps+1)*.1)
-        world=SRAIRLProceduralWorld(scenario_type,lane_num,traffic_density,view_mode,seed,horizon)
+        world=SRAIRLProceduralWorld(scenario_type,lane_num,traffic_density,view_mode,seed,horizon,traffic_seed)
         super().__init__(placeholder,dynamics_mode="metadrive_physics",config=config,metadrive_world=world)
         self.observer=SRAIRLObservationAdapter(self.config.history_len,
             pos_lat_scale=self.config.pos_lat_scale,pos_long_scale=self.config.pos_long_scale,

@@ -67,18 +67,28 @@ def test_metadrive_physics_controls_both_interaction_actors():
     world=create_srairl_metadrive_world(scene,"train","topdown",True,"metadrive_physics")
     env=SRAIRLEnv(scene,dynamics_mode="metadrive_physics",metadrive_world=world)
     try:
-        env.reset()
-        assert world.is_multi_agent and set(world.agents)=={"agent0","agent1"}
-        before={role:env.vehicles[ident]["lon"] for role,ident in (("elcv",scene.elcv_id),("rfv",scene.rfv_id))}
-        before_speed={role:env.vehicles[ident]["v_long"] for role,ident in (("elcv",scene.elcv_id),("rfv",scene.rfv_id))}
-        for _ in range(5):
-            _,info=env.step({"elcv":[1.,0.],"rfv":[-1.,0.]})
-        assert env.vehicles[scene.elcv_id]["lon"]>before["elcv"]
-        assert env.vehicles[scene.rfv_id]["lon"]>before["rfv"]
-        assert env.vehicles[scene.elcv_id]["v_long"]>env.vehicles[scene.rfv_id]["v_long"]
-        assert (env.vehicles[scene.elcv_id]["v_long"]-before_speed["elcv"])/.5 == pytest.approx(1.,abs=.35)
-        assert (env.vehicles[scene.rfv_id]["v_long"]-before_speed["rfv"])/.5 == pytest.approx(-1.,abs=.5)
-        assert info["dynamics_mode"]=="metadrive_physics"
+        for speed in (5.,10.,20.,30.):
+            env.reset()
+            assert world.is_multi_agent and set(world.agents)=={"agent0","agent1"}
+            for role in ("elcv","rfv"):
+                vehicle=world.role_vehicle(role)
+                vehicle.set_velocity((speed,0.))
+                vehicle.set_heading_theta(0.)
+            before={role:env._read_world_state(world.role_vehicle(role))["v_long"] for role in ("elcv","rfv")}
+            before_x={role:float(world.role_vehicle(role).position[0]) for role in ("elcv","rfv")}
+            for _ in range(5):
+                _,info=env.step({"elcv":[1.,0.],"rfv":[-1.,0.]})
+            actual_positive=(env.vehicles[scene.elcv_id]["v_long"]-before["elcv"])/.5
+            actual_braking=(env.vehicles[scene.rfv_id]["v_long"]-before["rfv"])/.5
+            assert actual_braking < 0
+            if speed < 30.:
+                assert actual_positive > 0
+                if speed == 10.:
+                    assert actual_positive == pytest.approx(1.,abs=.35)
+                    assert actual_braking == pytest.approx(-1.,abs=.5)
+            assert world.role_vehicle("elcv").position[0] > before_x["elcv"]
+            assert world.role_vehicle("rfv").position[0] > before_x["rfv"]
+            assert info["dynamics_mode"]=="metadrive_physics"
     finally:
         env.close()
 
@@ -229,7 +239,8 @@ def test_studio_srairl_request_requires_explicit_distinct_ngsim_roles(monkeypatc
     request=clean_srairl_request({"srairl_scenarios":[{"dataset_id":"a"*24,"roles":{
         "elcv_id":"0","rfv_id":"1","rlv_current_id":"2","rlv_target_id":"3"}}],
         "srairl_episodes":2,"srairl_ppo_epochs":2,"srairl_seed":0,"srairl_device":"cpu"},"train")
-    assert request["dynamics_mode"]=="metadrive_physics"
+    assert request["dynamics_mode"]=="legacy_kinematic"
+    assert request["srairl_reactive_background"] is False
     with pytest.raises(ValueError,match="不同轨迹"):
         clean_srairl_request({"srairl_scenarios":[{"dataset_id":"a"*24,"roles":{
             "elcv_id":"0","rfv_id":"0","rlv_current_id":"2","rlv_target_id":"3"}}]},"train")
@@ -240,6 +251,7 @@ def test_studio_srairl_request_requires_explicit_distinct_ngsim_roles(monkeypatc
 
 
 def test_srairl_trainer_runs_one_alternating_update_end_to_end():
+    import torch
     from datasets.srairl.expert_builder import ExpertDatasetBuilder
     from rl.srairl.trainer import SRAIRLTrainer, SRAIRLTrainingConfig
     from rl.srairl.config import SRAIRLConfig
@@ -249,8 +261,17 @@ def test_srairl_trainer_runs_one_alternating_update_end_to_end():
     env = SRAIRLEnv(scene, config=cfg)
     train_cfg = SRAIRLTrainingConfig(episodes=1, ppo_epochs=2, discriminator_every_episodes=1,
         discriminator_batch_size=2, discriminator_updates=1, lambda_equilibrium=0., device="cpu")
-    trainer = SRAIRLTrainer([env], expert, config=cfg, training_config=train_cfg)
-    history = trainer.train()
-    assert len(history) == 1
-    assert "discriminator_loss" in history[0]
-    assert trainer.episode == 1
+    with tempfile.TemporaryDirectory() as temp:
+        trainer = SRAIRLTrainer([env], expert, config=cfg, training_config=train_cfg, output_dir=temp)
+        history = trainer.train()
+        assert len(history) == 1
+        assert "discriminator_loss" in history[0]
+        assert trainer.episode == 1
+        assert (Path(temp) / "training_state.pt").is_file()
+        resumed = SRAIRLTrainer([env], expert, config=cfg, training_config=train_cfg)
+        resumed.load_training_state(temp)
+        assert resumed.episode == trainer.episode
+        assert resumed.global_steps == trainer.global_steps
+        assert resumed.next_decay_step == trainer.next_decay_step
+        for actual, expected in zip(resumed.policy_elcv.policy.parameters(), trainer.policy_elcv.policy.parameters()):
+            assert torch.equal(actual, expected)

@@ -8,6 +8,7 @@ before results can be treated as an exact reproduction of upstream dynamics.
 """
 import numpy as np
 from env.adapters.srairl_observation import SRAIRLObservationAdapter
+from env.adapters.srairl_action import SRAIRLActionAdapter
 from rl.srairl.config import SRAIRLConfig
 
 
@@ -30,6 +31,7 @@ class SRAIRLEnv:
         self._metadrive_collision = False
         self._metadrive_out_of_road = False
         self.config = config or SRAIRLConfig.from_mapping()
+        self.action_adapter = SRAIRLActionAdapter.from_yaml()
         history_len = self.config.history_len if history_len is None else history_len
         self.observer = SRAIRLObservationAdapter(history_len,
             pos_lat_scale=self.config.pos_lat_scale, pos_long_scale=self.config.pos_long_scale,
@@ -83,6 +85,9 @@ class SRAIRLEnv:
             self.vehicles[ident] = {"lat": float(y), "lon": float(x), "v_long": float(vx), "v_lat": float(vy), "a_long": 0., "a_lat": 0.}
         obs = self.observer.reset(self._roles(self.time))
         if self.world is not None:
+            traffic_manager=getattr(getattr(self.world,"engine",None),"traffic_manager",None)
+            if traffic_manager is not None and hasattr(traffic_manager,"set_controlled_vehicles"):
+                traffic_manager.set_controlled_vehicles([])
             self.world.reset()
             if self.dynamics_mode=="metadrive_physics":
                 self.world.place_actors_at(self.time)
@@ -126,20 +131,8 @@ class SRAIRLEnv:
         pos=np.asarray(vehicle.position,dtype=float);vel=np.asarray(vehicle.velocity,dtype=float)
         return {"lat":float(pos[1]),"lon":float(pos[0]),"v_long":float(vel[0]),"v_lat":float(vel[1]),"a_long":0.,"a_lat":0.}
 
-    @staticmethod
-    def _to_metadrive_action(vehicle,acceleration):
-        a_long,a_lat=map(float,acceleration)
-        speed=max(float(vehicle.speed),2.)
-        wheelbase=2.7
-        max_steering=max(float(getattr(vehicle,"max_steering",.7)),.1)
-        steering=float(np.clip(np.arctan(wheelbase*a_lat/(speed*speed))/max_steering,-1.,1.))
-        # MetaDrive's negative longitudinal action applies much stronger
-        # braking than positive throttle. These gains were measured on the
-        # pinned 0.4.3 vehicle at 10 m/s; they keep the action scale close to
-        # the upstream acceleration units while preserving physical dynamics.
-        longitudinal_gain=2.35 if a_long>=0. else 12.5
-        throttle=float(np.clip(a_long/longitudinal_gain,-1.,1.))
-        return np.asarray([steering,throttle],dtype=np.float32)
+    def _to_metadrive_action(self,vehicle,acceleration):
+        return self.action_adapter.to_metadrive(vehicle,acceleration,self.dt)
 
     @staticmethod
     def _sync_world_vehicle(vehicle,state):

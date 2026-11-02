@@ -27,7 +27,7 @@ class SRAIRLMetaDriveWorld(MultiAgentMetaDrive):
             agent_configs[agent_id]={
                 "vehicle_model":"varying_dynamics_bounding_box",
                 "length":float(track.get("length",4.5)),"width":float(track.get("width",1.8)),"height":1.5,
-                "spawn_longitude":5. if role=="elcv" else 20.,
+                "spawn_longitude":30. if role=="elcv" else 15.,
                 "spawn_lane_index":(FirstPGBlock.NODE_1,FirstPGBlock.NODE_2,0 if role=="elcv" else min(1,scenario.lane_num-1)),
                 "enable_reverse":False,"show_navi_mark":False,"show_dest_mark":False,
                 "random_color":False,"use_special_color":True,
@@ -134,7 +134,7 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
     """
 
     def __init__(self, scenario_type="straight", lane_num=3, traffic_density=.15,
-                 view_mode="topdown", seed=0, horizon=1000):
+                 view_mode="topdown", seed=0, horizon=1000, traffic_seed=None):
         from metadrive.component.pgblock.first_block import FirstPGBlock
         map_code={"straight":"S", "curve":"C", "merge":"r"}.get(scenario_type)
         if map_code is None:
@@ -143,12 +143,13 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
             raise ValueError("SR-AIRL paired interaction requires at least two lanes")
         self.view_mode=view_mode
         self.scenario_type=scenario_type
+        self.traffic_seed=int(seed if traffic_seed is None else traffic_seed)
         self.policy_roles={"elcv":"agent0", "rfv":"agent1"}
         lane_prefix=(FirstPGBlock.NODE_1,FirstPGBlock.NODE_2)
         agent_configs={
-            "agent0":dict(spawn_lane_index=(*lane_prefix,0),spawn_longitude=8.,
+            "agent0":dict(spawn_lane_index=(*lane_prefix,0),spawn_longitude=30.,
                            use_special_color=True,show_navi_mark=False,show_dest_mark=False),
-            "agent1":dict(spawn_lane_index=(*lane_prefix,1),spawn_longitude=21.,
+            "agent1":dict(spawn_lane_index=(*lane_prefix,1),spawn_longitude=15.,
                            use_special_color=True,show_navi_mark=False,show_dest_mark=False),
         }
         render_3d=view_mode!="topdown"
@@ -156,7 +157,7 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
             "is_multi_agent":True,"num_agents":2,"agent_configs":agent_configs,
             "random_agent_model":False,"allow_respawn":False,"delay_done":0,
             "crash_done":False,"out_of_road_done":False,
-            "traffic_density":float(traffic_density),"random_traffic":True,
+            "traffic_density":float(traffic_density),"random_traffic":False,
             "map":map_code,"map_config":{"lane_num":int(lane_num),"lane_width":3.5,"exit_length":500.},
             # The wrapper terminates its own rollout one step before MetaDrive
             # truncation so both controlled agents remain available for the
@@ -171,6 +172,17 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
             config.update(window_size=(640,480),show_logo=False,show_fps=False,
                           sensors={"main_camera":("MainCamera",640,480)})
         super().__init__(config)
+
+    def setup_engine(self):
+        super().setup_engine()
+        from metadrive.manager.traffic_manager import PGTrafficManager
+
+        traffic_seed=self.traffic_seed
+        class SeededPGTrafficManager(PGTrafficManager):
+            def seed(self, random_seed):
+                return super().seed((int(random_seed)+traffic_seed) % (2**32))
+
+        self.engine.update_manager("traffic_manager",SeededPGTrafficManager())
 
     def _post_process_config(self,config):
         dimensions={k:config["map_config"][k] for k in ("lane_num","lane_width","exit_length")}

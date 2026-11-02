@@ -1,7 +1,6 @@
 # MetaDrive 安全强化学习实验室
 
-单智能体驾驶研究环境，支持 SAC、SAC-Lagrangian、WCSAC 和 WCSAC-IQN。
-包含真实 MetaDrive 场景预览、实时俯视仿真、训练/评估曲线及文件下载。
+自动驾驶科研实验平台，分为 Safe RL 单车 CMDP 与 SR-AIRL 双策略车交互两条独立实验线。Safe RL 支持 SAC、SAC-Lagrangian、WCSAC 和 WCSAC-IQN；SR-AIRL 支持明确绑定角色的 NGSIM 专家片段及 MetaDrive 生成道路。
 
 ## 启动
 
@@ -11,8 +10,7 @@ conda activate llm_drive
 python studio/server.py --port 6002
 ```
 
-打开 http://localhost:6002 。在训练页选择算法、地图和参数；在评估页选择模型与独立测试场景。
-训练从头初始化，不会自动续训评估下拉框中的模型。
+打开 http://localhost:6002 。Safe RL 训练/评估使用单车实验流程。SR-AIRL 的 NGSIM 默认流程采用上游运动学和固定背景轨迹回放；MetaDrive 物理及响应式背景属于独立迁移/敏感性实验。当前 SR-AIRL 训练检查点已保存优化器、步数和 RNG 状态，可通过 `SRAIRLTrainer.load_training_state()` 在相同配置与数据下恢复；Studio 尚未提供续训按钮。
 
 ## 目录
 

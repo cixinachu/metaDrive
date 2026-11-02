@@ -6,6 +6,7 @@ expert transitions built from source-verified ELCV/RFV/leader role assignments.
 """
 from dataclasses import dataclass
 from pathlib import Path
+import random
 import json
 import numpy as np
 import torch
@@ -90,6 +91,7 @@ class SRAIRLTrainer:
             self.device = torch.device(self.train_config.device)
         torch.manual_seed(self.train_config.seed)
         np.random.seed(self.train_config.seed)
+        random.seed(self.train_config.seed)
         self.expert = ExpertTransitions(expert_transitions, self.device)
         state_dim = self.config.frame_state_dim * self.config.history_len
         self.policy_elcv = PPO(state_dim, 2, self.train_config.actor_lr, self.train_config.critic_lr,
@@ -213,10 +215,56 @@ class SRAIRLTrainer:
         self.policy_rfv.save(directory / "policy_rfv.pt")
         torch.save(self.discriminator_elcv.state_dict(), directory / "discriminator_elcv.pt")
         torch.save(self.discriminator_rfv.state_dict(), directory / "discriminator_rfv.pt")
+        torch.save({
+            "episode": self.episode,
+            "global_steps": self.global_steps,
+            "next_decay_step": self.next_decay_step,
+            "policy_elcv_optimizer": self.policy_elcv.optimizer.state_dict(),
+            "policy_rfv_optimizer": self.policy_rfv.optimizer.state_dict(),
+            "discriminator_optimizer": self.discriminator_optimizer.state_dict(),
+            "python_rng": random.getstate(),
+            "numpy_rng": np.random.get_state(),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "seed": self.train_config.seed,
+        }, directory / "training_state.pt")
         (directory / "config.json").write_text(json.dumps({"algorithm": "SR-AIRL", "srairl": self.config.__dict__,
             "training": self.train_config.__dict__, "episode": self.episode, "global_steps": self.global_steps,
             "dynamics_mode":self.envs[0].dynamics_mode,
             "reactive_background":bool(getattr(getattr(getattr(self.envs[0].world,"engine",None),"traffic_manager",None),"reactive",False))}, indent=2))
+
+    def load_training_state(self, directory):
+        """Resume a trusted local checkpoint at an episode boundary."""
+        directory = Path(directory)
+        metadata = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        if metadata.get("srairl") != self.config.__dict__:
+            raise ValueError("checkpoint SR-AIRL configuration does not match the current run")
+        if metadata.get("training") != self.train_config.__dict__:
+            raise ValueError("checkpoint training configuration does not match the current run")
+        dynamics = metadata.get("dynamics_mode")
+        if dynamics != self.envs[0].dynamics_mode:
+            raise ValueError("checkpoint dynamics mode does not match the current environment")
+        self.policy_elcv.load(directory / "policy_elcv.pt")
+        self.policy_rfv.load(directory / "policy_rfv.pt")
+        self.discriminator_elcv.load_state_dict(torch.load(
+            directory / "discriminator_elcv.pt", map_location=self.device, weights_only=True))
+        self.discriminator_rfv.load_state_dict(torch.load(
+            directory / "discriminator_rfv.pt", map_location=self.device, weights_only=True))
+        state = torch.load(directory / "training_state.pt", map_location="cpu", weights_only=False)
+        if int(state.get("seed", -1)) != self.train_config.seed:
+            raise ValueError("checkpoint RNG seed does not match the current run")
+        self.policy_elcv.optimizer.load_state_dict(state["policy_elcv_optimizer"])
+        self.policy_rfv.optimizer.load_state_dict(state["policy_rfv_optimizer"])
+        self.discriminator_optimizer.load_state_dict(state["discriminator_optimizer"])
+        self.episode = int(state["episode"])
+        self.global_steps = int(state["global_steps"])
+        self.next_decay_step = int(state["next_decay_step"])
+        random.setstate(state["python_rng"])
+        np.random.set_state(state["numpy_rng"])
+        torch.set_rng_state(state["torch_rng"])
+        if torch.cuda.is_available() and state.get("cuda_rng") is not None:
+            torch.cuda.set_rng_state_all(state["cuda_rng"])
+        return self
 
     @staticmethod
     def load_policies(directory, config, training_config, device="cpu"):

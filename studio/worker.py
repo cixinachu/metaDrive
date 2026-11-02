@@ -366,8 +366,8 @@ def build_srairl_envs(scenarios,c,config):
     from env.tasks.srairl_env import SRAIRLEnv
     if c.get('scene_source','ngsim')=='procedural':
         from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
-        return [SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c['seed'],
-            c['horizon'],c.get('srairl_view','topdown'),config=config)]
+        return [SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c.get('scene_seed',c['seed']),
+            c['horizon'],c.get('srairl_view','topdown'),config=config,traffic_seed=c.get('traffic_seed'))]
     envs=[]
     for scenario in scenarios:
         world=create_srairl_metadrive_world(scenario,'train' if scenario.split=='train' else 'eval',c.get('srairl_view','topdown'),
@@ -387,7 +387,8 @@ def save_srairl_input_manifest(directory,c):
                          'split':manifest['split'],'recording_group':manifest.get('recording_group'),
                          'roles':item['roles']})
     atomic_json(directory/'dataset_manifest.json',{'task':'SR-AIRL','dynamics_mode':c.get('dynamics_mode','legacy_kinematic'),'metadrive_world':bool(c.get('metadrive_world',True)),
-        'reactive_background':bool(c.get('srairl_reactive_background',True)),
+        'scene_seed':c.get('scene_seed',c.get('seed')),'traffic_seed':c.get('traffic_seed'),'rl_seed':c.get('rl_seed',c.get('seed')),
+        'reactive_background':bool(c.get('srairl_reactive_background',False)),
         'scene_source':c.get('scene_source','ngsim'),'scenario':c.get('scenario','straight'),
         'lane_num':c.get('lane_num'),'traffic_density':c.get('traffic_density'),
         'expert_dataset_id':c.get('expert_dataset_id'),
@@ -408,7 +409,7 @@ def train_srairl(directory,c):
         expert,_=load_transitions(ROOT/c['expert_dataset_id'])
     else:
         expert=[transition for scene in scenarios for transition in ExpertDatasetBuilder(config=config).build(scene)]
-    training=SRAIRLTrainingConfig(episodes=c['episodes'],ppo_epochs=c['ppo_epochs'],seed=c['seed'],device=c['device'])
+    training=SRAIRLTrainingConfig(episodes=c['episodes'],ppo_epochs=c['ppo_epochs'],seed=c.get('rl_seed',c['seed']),device=c['device'])
     trainer=SRAIRLTrainer(envs,expert,config=config,training_config=training,output_dir=directory)
     recorder=Recorder(directory)
     try:
@@ -427,7 +428,9 @@ def train_srairl(directory,c):
         trainer.train(callback=report)
         trainer.save()
         saved=json.loads((directory/'config.json').read_text());saved['dynamics_mode']=c.get('dynamics_mode','legacy_kinematic')
-        saved['reactive_background']=bool(c.get('srairl_reactive_background',True))
+        saved['scene_seed']=c.get('scene_seed',c.get('seed'));saved['traffic_seed']=c.get('traffic_seed')
+        saved['rl_seed']=c.get('rl_seed',c.get('seed'))
+        saved['reactive_background']=bool(c.get('srairl_reactive_background',False))
         saved['scene_source']=c.get('scene_source','ngsim');saved['scenario']=c.get('scenario','straight')
         saved['lane_num']=c.get('lane_num');saved['traffic_density']=c.get('traffic_density');saved['horizon']=c.get('horizon')
         atomic_json(directory/'config.json',saved)
@@ -440,7 +443,7 @@ def train_srairl(directory,c):
                      lane_num=c.get('lane_num'),traffic_density=c.get('traffic_density'),
                      background_traffic_count=(envs[0]._last_info.get('traffic_vehicle_count') if hasattr(envs[0],'_last_info') else None),
                      dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
-                     reactive_background=bool(c.get('srairl_reactive_background',True)),checkpoint=str(directory.relative_to(ROOT)))
+                     reactive_background=bool(c.get('srairl_reactive_background',False)),checkpoint=str(directory.relative_to(ROOT)))
         atomic_json(directory/'summary.json',summary)
         return dict(state=state,kind='train',step=trainer.episode,total=c['episodes'],episodes=trainer.episode,
                     global_steps=trainer.global_steps,device=str(trainer.device))
@@ -454,8 +457,8 @@ def collect_srairl_expert(directory,c):
     from datasets.srairl.expert_builder import save_transitions
     from datasets.srairl.metadrive_expert import collect_metadrive_expert
     from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
-    env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c['seed'],
-        c['horizon'],c['srairl_view'])
+    env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c.get('scene_seed',c['seed']),
+        c['horizon'],c['srairl_view'],traffic_seed=c.get('traffic_seed'))
     recorder=Recorder(directory)
     try:
         def report(state):
@@ -570,7 +573,8 @@ def evaluate_srairl(directory,c):
     policies=SRAIRLTrainer.load_policies(path,config,training,device=c['device'] if c['device']!='auto' else ('cuda' if torch.cuda.is_available() else 'cpu'))
     if c.get('scene_source')=='procedural':
         from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
-        env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c['seed'],c['horizon'],c.get('srairl_view','topdown'),config=config)
+        env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c.get('scene_seed',c['seed']),
+            c['horizon'],c.get('srairl_view','topdown'),config=config,traffic_seed=c.get('traffic_seed'))
         save_srairl_input_manifest(directory,c);return evaluate_srairl_procedural(directory,c,env,policies,training)
     scenarios=build_srairl_scenarios(c,'eval')
     save_srairl_input_manifest(directory,c)
