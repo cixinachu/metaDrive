@@ -1,0 +1,334 @@
+import argparse
+import torch.nn as nn
+import torch.nn.functional as F
+from model.backbone import NoisyReward
+from model.ddpm import GaussianDiffusionTrainer
+import copy
+import time
+from tqdm import tqdm
+from model.related_module import *
+import sys
+from pathlib import Path
+base_dir = Path(__file__).resolve().parent
+root_dir = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(root_dir))
+# 确保本地 utils 可被导入（避免相对路径运行时报 ModuleNotFoundError）
+sys.path.append(str(base_dir))
+from utils.dataset import data_loader
+import random
+from torch.utils.tensorboard import SummaryWriter  # TensorBoard 记录
+import os
+from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+
+def setup_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+
+
+def eval(args, loader, trainer, model, fv_reward):
+    model.eval()
+    device = args.device
+    loss_list = []
+    for batch in loader:
+        lcv_traj = batch[0].cpu().numpy()
+        fv_traj = batch[1].cpu().numpy()
+        nlv_traj = batch[2].cpu().numpy()
+        olv_traj = batch[3].cpu().numpy()
+
+        # Generate true reward
+        n_lcv = normalize_obs(copy.deepcopy(lcv_traj))
+        n_fv = normalize_obs(copy.deepcopy(fv_traj))
+        n_nlv = normalize_obs(copy.deepcopy(nlv_traj))
+        n_olv = normalize_obs(copy.deepcopy(olv_traj))
+
+        dfv = n_lcv - n_fv
+        dnlv = n_nlv - n_lcv
+        dolv = n_olv - n_lcv
+
+        state = torch.from_numpy(np.concatenate([n_lcv, dfv, dnlv, dolv], axis=-1)).to(device).float()
+        true_reward = fv_reward(state)
+
+        # Noisy data
+        noisy_fv, t = trainer(torch.from_numpy(n_fv).to(device))
+        noisy_dfv = n_lcv - noisy_fv.cpu().numpy()
+        noisy_state = torch.from_numpy(np.concatenate([n_lcv, noisy_dfv, dnlv, dolv], axis=-1)).to(device).float()
+        pred_reward = model(noisy_state, t)
+
+        loss = F.mse_loss(pred_reward, true_reward)
+        loss_list.append(loss.item())
+
+    model.train()
+
+    return np.mean(loss_list)
+
+
+def train(args):
+    device = args.device
+
+    model = NoisyReward(args.context_dim, args.T)
+    ema_model = copy.deepcopy(model)
+    guide = None
+
+    # show model size
+    model_size = 0
+    for param in ema_model.parameters():
+        model_size += param.data.nelement()
+    print('Model params: %.2f M' % (model_size / 1024 / 1024))
+
+    trainer = GaussianDiffusionTrainer(model, beta_1=args.beta_1, beta_T=args.beta_T, T=args.T).to(device)
+    optim = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    # dataset
+    path = ''
+    val_path = ''
+
+    train_loader = data_loader(args.obs_len, args.pred_len, args.skip, args.batch_size, path,
+                               save_path=args.data_path, if_test='train')
+    test_loader = data_loader(args.obs_len, args.pred_len_val, args.skip, args.batch_size * 4, val_path,
+                              shuffle=False, save_path=args.data_path, if_test='test')
+    # 安全加载判别器奖励网络（路径指向 Step1_Reward_Recovery/disc_fv.pt）
+    if args.srairl_model:
+        from rl.srairl.upstream.adapter import load_reward_discriminator
+        disc = load_reward_discriminator(args.srairl_model, device=device)
+    elif args.discriminator_path:
+        # Legacy upstream checkpoints are trusted user-selected files. Do not
+        # silently fall back to the historical machine-specific path.
+        from torch.serialization import add_safe_globals
+        sys.path.append(str(base_dir.parent / "Step1_Reward_Recovery"))
+        from airl import AIRLDiscrim, SocialAIRLDiscrim, SocialPotentialNet
+        add_safe_globals([AIRLDiscrim, SocialAIRLDiscrim, SocialPotentialNet])
+        disc = torch.load(args.discriminator_path, map_location=device, weights_only=False)
+    else:
+        raise ValueError("provide --srairl-model from Studio or --discriminator-path for an upstream checkpoint")
+
+    def _infer_hist_len(disc_obj):
+        if hasattr(disc_obj, "history_len"):
+            return disc_obj.history_len
+        """
+        从判别器首层 Linear 的输入维度推断历史堆叠倍数（Step1 训练时用 4 帧 -> 64 维）。
+        若无法推断则退化为 1（不堆叠）。
+        """
+        in_dim = None
+        first_linear = None
+        if hasattr(disc_obj, "private_g"):
+            first_linear = next((m for m in disc_obj.private_g if isinstance(m, nn.Linear)), None)
+        if in_dim is None and first_linear is not None:
+            in_dim = first_linear.in_features
+        if in_dim is None and hasattr(disc_obj, "g"):
+            first_linear = next((m for m in disc_obj.g if isinstance(m, nn.Linear)), None)
+            if first_linear is not None:
+                in_dim = first_linear.in_features
+        if in_dim is not None and in_dim % 16 == 0:
+            return max(1, in_dim // 16)
+        return 1
+
+    _disc_hist_len = _infer_hist_len(disc)
+    def _stack_history_states(states, hist_len):
+        """
+        将 (B, T, 16) 叠成 (B, T, 16*hist_len)，前几帧用第 0 帧填充，保持与判别器训练时一致。
+        """
+        if hist_len <= 1:
+            return states
+        bsz, seq_len, feat = states.shape
+        history = [states[:, 0, :]] * hist_len  # 初始重复首帧
+        stacked = []
+        for t in range(seq_len):
+            if t > 0:
+                history.pop(0)
+                history.append(states[:, t, :])
+            stacked.append(torch.cat(history, dim=-1))
+        return torch.stack(stacked, dim=1)  # (B, T, hist_len*feat)
+
+    def fv_reward(state):
+        """
+        state: (B, T, 16) -> 输出 (B, T, 1)
+        兼容两类判别器：
+          - SocialAIRLDiscrim：直接使用 get_reward 返回的 r_total
+          - AIRLDiscrim：仅使用 g (私有奖励)
+        """
+        batch_size, seq_len = state.shape[:2]
+        state_hist = _stack_history_states(state, _disc_hist_len)
+        flat = state_hist.reshape(-1, state_hist.shape[-1])
+        if hasattr(disc, "get_reward"):
+            r_total, _, _ = disc.get_reward(flat)
+            return r_total.view(batch_size, seq_len, -1)
+
+        elif hasattr(disc, "g"):
+            total = disc.g(flat)
+        else:
+            total = disc(flat)
+        return total.view(state_hist.shape[0], state_hist.shape[1], -1)
+    best_ade = 1e5
+    best_epoch = None
+
+    # 统一日志和模型保存路径（runs/planner_goal 下每次一个时间戳目录），直接复用模块级 base_dir
+    time_str = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_dir = Path(args.output_dir) if args.output_dir else base_dir / "runs" / "planner_goal" / f"train_{time_str}"
+    writer = SummaryWriter(log_dir=str(log_dir))
+    print(f">>> TensorBoard logging to: {log_dir}")
+    results_dir = log_dir / "results"
+    os.makedirs(results_dir, exist_ok=True)
+
+    metrics_started = time.monotonic()
+    for epoch in range(args.total_epoch):
+        if args.studio_dir and (Path(args.studio_dir) / 'STOP').exists():
+            break
+        epoch_loss = []
+
+        for batch in train_loader:
+            lcv_traj = batch[0].cpu().numpy()
+            fv_traj = batch[1].cpu().numpy()
+            nlv_traj = batch[2].cpu().numpy()
+            olv_traj = batch[3].cpu().numpy()
+
+            optim.zero_grad()
+            cur_lr = optim.state_dict()['param_groups'][0]['lr']
+
+            # Supervise noisy inputs with the total reward of the clean state.
+            n_lcv = normalize_obs(copy.deepcopy(lcv_traj))
+            n_fv = normalize_obs(copy.deepcopy(fv_traj))
+            n_nlv = normalize_obs(copy.deepcopy(nlv_traj))
+            n_olv = normalize_obs(copy.deepcopy(olv_traj))
+
+            dfv = n_lcv - n_fv
+            dnlv = n_nlv - n_lcv
+            dolv = n_olv - n_lcv
+
+            clean_state = torch.from_numpy(np.concatenate([n_lcv, dfv, dnlv, dolv], axis=-1)).to(device).float()
+            with torch.no_grad():
+                true_reward = fv_reward(clean_state)
+
+            # Noisy data
+            noisy_fv, t = trainer(torch.from_numpy(n_fv).to(device))
+            noisy_dfv = n_lcv - noisy_fv.cpu().numpy()
+            noisy_state = torch.from_numpy(np.concatenate([n_lcv, noisy_dfv, dnlv, dolv], axis=-1)).to(device).float()
+            pred_reward = model(noisy_state, t)
+
+            loss = F.mse_loss(pred_reward, true_reward)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optim.step()
+
+            epoch_loss.append(loss.item())
+
+            # break
+
+        if epoch % args.print_step == 0:
+            print('Epoch {}, loss {:.6f}, lr {}'.format(epoch, np.mean(epoch_loss), cur_lr))
+
+        if epoch % args.sample_step == 0:
+            val_ade = eval(args, test_loader, trainer, model, fv_reward)
+
+            if val_ade < best_ade:
+                best_ade = val_ade
+                best_epoch = epoch
+                print('Best model updated, testing ...')
+                eval(args, test_loader, trainer, model, fv_reward)
+
+                # 保存到当前日志目录的 results 子目录
+                # This source had never updated ema_model, so saving it yielded
+                # random initialization. The trained model is the valid best.
+                torch.save(model, results_dir / 'best_model.pth')
+
+        values = {'train/loss': float(np.mean(epoch_loss))}
+        if epoch % args.sample_step == 0:
+            values['validation/reward_mse'] = float(val_ade)
+        if args.studio_dir:
+            studio_dir = Path(args.studio_dir)
+            with (studio_dir / 'metrics.jsonl').open('a', encoding='utf-8') as stream:
+                import json
+                stream.write(json.dumps({'step': epoch + 1, 'elapsed': time.monotonic()-metrics_started, 'values': values}, allow_nan=False) + '\n')
+            status = {'state': 'running', 'kind': 'train', 'step': epoch + 1,
+                      'total': args.total_epoch, 'episodes': 0, 'device': str(device)}
+            tmp = studio_dir / 'status.json.tmp'
+            tmp.write_text(__import__('json').dumps(status), encoding='utf-8')
+            tmp.replace(studio_dir / 'status.json')
+
+        # TensorBoard 记录训练/验证指标
+        writer.add_scalar('train/loss', np.mean(epoch_loss), epoch)
+        if epoch % args.sample_step == 0:
+            writer.add_scalar('val/ade', val_ade, epoch)
+        writer.add_scalar('train/lr', optim.state_dict()['param_groups'][0]['lr'], epoch)
+
+    writer.close()
+    if args.studio_dir:
+        import json
+        studio_dir = Path(args.studio_dir)
+        checkpoint = results_dir / 'best_model.pth'
+        if not checkpoint.is_file():
+            raise RuntimeError('reward guide did not produce a validation-selected checkpoint')
+        summary = {'task': 'reward_guide', 'algorithm': 'SR-AIRL Reward Guide',
+                   'best_epoch': best_epoch, 'best_validation_reward_mse': float(best_ade),
+                   'checkpoint': str(checkpoint.relative_to(Path(args.output_dir).resolve())),
+                   'upstream_revision': 'a762fd1c4099ce27eda1fa4f26372c007fab0129',
+                   'dataset': str(Path(args.data_path).resolve()), 'seed': args.seed}
+        tmp = studio_dir / 'summary.json.tmp'
+        tmp.write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
+        tmp.replace(studio_dir / 'summary.json')
+
+
+def main(args):
+    train(args)
+
+
+if __name__ == "__main__":
+    setup_seed(42)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--device', type=str, default='cuda')
+
+    # Dataset
+    parser.add_argument('--obs_len', type=int, default=20)
+    parser.add_argument('--pred_len', type=int, default=100)
+    parser.add_argument('--pred_len_val', type=int, default=100)
+    parser.add_argument('--skip', type=int, default=5)
+
+    # Backbone
+    parser.add_argument('--node_feat_dim', type=int, default=0)
+    parser.add_argument('--time_dim', type=int, default=64)
+    parser.add_argument('--context_dim', type=int, default=64)
+    parser.add_argument('--hidden_dim', type=int, default=64)
+
+    # Diffusion
+    parser.add_argument('--beta_1', type=int, default=1e-4)
+    parser.add_argument('--beta_T', type=int, default=0.05)
+    parser.add_argument('--T', type=int, default=100)
+
+    # Training
+    parser.add_argument('--lr', type=float, default=2e-4)
+    parser.add_argument('--grad_clip', type=float, default=1.)
+    parser.add_argument('--total_epoch', type=int, default=100000)
+    parser.add_argument('--warmup', type=int, default=5000)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--ema_decay', type=float, default=0.999)
+    parser.add_argument('--sample_step', type=int, default=10)
+    parser.add_argument('--print_step', type=int, default=5)
+    parser.add_argument('--data_path', type=str, default=str(root_dir / 'rl/srairl/upstream/data/sample_data.pkl'))
+    parser.add_argument('--output_dir', type=str, default='')
+    parser.add_argument('--srairl_model', type=str, default='')
+    parser.add_argument('--discriminator_path', type=str, default='')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--studio_dir', type=str, default='')
+
+    args = parser.parse_args()
+    setup_seed(args.seed)
+    main(args)
+
+
+
+
+
+
+
+
+
+
+
+
+

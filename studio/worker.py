@@ -13,6 +13,7 @@ import traceback
 import hashlib
 import importlib.metadata
 import math
+import subprocess
 import numpy as np
 import torch
 import gymnasium as gym
@@ -50,18 +51,33 @@ class ViewEnv(gym.Wrapper):
         self.directory, self.interval, self.last_frame = directory, interval, 0
         self.overview = overview
 
+    def pixels(self):
+        if self.env.unwrapped.view_mode != 'topdown':
+            return np.asarray(self.env.unwrapped.camera_frame()).astype(np.uint8)
+        options = {"scaling": 10}
+        if self.overview:
+            x0,x1,y0,y1 = self.env.current_map.road_network.get_bounding_box()
+            options.update(camera_position=((x0+x1)/2,(y0+y1)/2), scaling=700/max(x1-x0,y1-y0,1))
+        # The preview panel is displayed at <500 CSS pixels; a large offscreen
+        # film buffer adds seconds without making the road layout more legible.
+        return np.asarray(self.env.render(mode='topdown', window=False, screen_size=(480,480), film_size=(640,640),
+                                     num_stack=1, draw_target_vehicle_trajectory=False, **options)).astype(np.uint8)
+
     def frame(self, force=False):
         if not force and time.monotonic()-self.last_frame < self.interval:
             return
-        if self.env.unwrapped.view_mode != 'topdown':
-            pixels = self.env.unwrapped.camera_frame()
-        else:
-            options = {"scaling": 10}
-            if self.overview:
-                x0,x1,y0,y1 = self.env.current_map.road_network.get_bounding_box()
-                options.update(camera_position=((x0+x1)/2,(y0+y1)/2), scaling=700/max(x1-x0,y1-y0,1))
-            pixels = self.env.render(mode='topdown', window=False, screen_size=(800,800), film_size=(1600,1600),
-                                     num_stack=3, draw_target_vehicle_trajectory=False, **options)
+        pixels = self.pixels()
+        if self.overview:
+            rgb=np.asarray(pixels).astype(np.uint8)
+            mask=np.any(rgb<238,axis=2)
+            ys,xs=np.where(mask)
+            if len(xs):
+                dense_rows=np.flatnonzero(mask.sum(axis=1)>max(80,int(rgb.shape[1]*.17)))
+                if len(dense_rows):ys=dense_rows
+                pad=max(18,int(min(rgb.shape[:2])*.035))
+                x0=max(0,int(xs.min())-pad);x1=min(rgb.shape[1],int(xs.max())+pad+1)
+                y0=max(0,int(ys.min())-pad);y1=min(rgb.shape[0],int(ys.max())+pad+1)
+                pixels=rgb[y0:y1,x0:x1]
         tmp = self.directory/'frame.tmp.jpg'
         Image.fromarray(np.asarray(pixels).astype(np.uint8)).save(tmp, quality=82)
         tmp.replace(self.directory/'frame.jpg')
@@ -69,7 +85,6 @@ class ViewEnv(gym.Wrapper):
 
     def reset(self, **kwargs):
         result = self.env.reset(**kwargs)
-        self.frame(True)
         return result
 
 
@@ -84,9 +99,12 @@ def render_srairl_frame(directory, env, info):
             pixels=env.world.camera_frame(overview=env.world.view_mode=='bird3d')
         image=Image.fromarray(np.asarray(pixels).astype(np.uint8));draw=ImageDraw.Draw(image)
         draw.rectangle((0,0,image.width,34),fill=(25,31,39))
-        draw.text((12,10),'MetaDrive · ELCV policy (blue) · RFV policy (orange) · RLV current (green) · OLV target (purple) · other replay (gray)',fill='white')
-        target=directory/'frame.tmp.jpg';image.save(target,quality=82);target.replace(directory/'frame.jpg')
-        return
+        mode=getattr(env,'dynamics_mode','legacy_kinematic');response=getattr(getattr(env.world.engine,'traffic_manager',None),'reactive',False)
+        if getattr(env,'scene_source',None)=='procedural':
+            caption=f'MetaDrive {env.scenario_type} · 2 SR-AIRL policy cars + {info.get("traffic_vehicle_count",0)} traffic vehicles'
+        else:caption=f'MetaDrive · {mode} · reactive replay {response} · ELCV (blue) · RFV (orange)'
+        draw.text((12,10),caption,fill='white')
+        return np.asarray(image.convert('RGB'))
     tracks=env.scenario.tracks
     t=float(info['time'])
     points=[]
@@ -125,9 +143,9 @@ def render_srairl_frame(directory, env, info):
         px,py=xy(x,y);color=palette[role]
         draw.rounded_rectangle((px-11,py-6,px+11,py+6),radius=3,fill=color,outline='white',width=2)
         draw.text((px+13,py-8),role.upper(),fill='white',stroke_width=1,stroke_fill='black')
-    draw.rectangle((0,0,width,56),fill=(25,31,39));draw.text((20,16),'SR-AIRL · NGSIM trajectory view · legacy kinematic (not MetaDrive physics)',fill='white')
+    draw.rectangle((0,0,width,56),fill=(25,31,39));draw.text((20,16),f'SR-AIRL · NGSIM · {env.dynamics_mode}',fill='white')
     draw.text((20,height-30),f"t={t:.1f}s   tracking reward={info['tracking_reward']:.4f}   collision proxy={info['controlled_collision_proxy']}",fill='white')
-    target=directory/'frame.tmp.jpg';image.save(target,quality=82);target.replace(directory/'frame.jpg')
+    return np.asarray(image.convert('RGB'))
 
 
 def attach_srairl_frame(directory,env,interval=.4):
@@ -140,8 +158,30 @@ def attach_srairl_frame(directory,env,interval=.4):
 
     def step(self, action):
         result = self.env.step(action)
-        self.frame(force=result[2] or result[3])
         return result
+
+
+class EpisodeVideo:
+    """Write evaluation frames directly to an MP4 without sending them to the browser."""
+    def __init__(self, directory, episode, fps=10):
+        import cv2
+        self.cv2=cv2
+        self.path=directory/'videos'/f'episode_{episode:04d}.mp4'
+        self.path.parent.mkdir(parents=True,exist_ok=True)
+        self.writer=None;self.fps=fps
+
+    def write(self, rgb):
+        frame=np.asarray(rgb,dtype=np.uint8)
+        if frame.ndim!=3 or frame.shape[2]<3:return
+        frame=np.ascontiguousarray(frame[:,:,:3])
+        if self.writer is None:
+            h,w=frame.shape[:2]
+            self.writer=self.cv2.VideoWriter(str(self.path),self.cv2.VideoWriter_fourcc(*'mp4v'),self.fps,(w,h))
+            if not self.writer.isOpened():raise RuntimeError('无法创建评估 MP4 视频文件')
+        self.writer.write(self.cv2.cvtColor(frame,self.cv2.COLOR_RGB2BGR))
+
+    def close(self):
+        if self.writer is not None:self.writer.release()
 
 
 def save_checkpoint(model, directory, name, c, env_config):
@@ -194,7 +234,7 @@ class TrainingCallback(BaseCallback):
 
 
 def train(directory,c,env_config):
-    env=ResearchVecEnv([lambda: Monitor(ViewEnv(StudioEnv(research_config=env_config, view_mode=c.get('view_mode','topdown')),directory,c['frame_interval']))])
+    env=ResearchVecEnv([lambda: Monitor(StudioEnv(research_config=env_config, view_mode=c.get('view_mode','topdown')))])
     recorder=Recorder(directory)
     logger=configure(str(directory/'tensorboard'), ['tensorboard','csv'])
     logger.output_formats.append(recorder)
@@ -235,14 +275,18 @@ def evaluate(directory,c,env_config,model_path):
     logger=configure(str(directory/'tensorboard'),['tensorboard','csv'])
     logger.output_formats.append(recorder)
     rows=[];steps=0
+    video=None
     try:
         for episode in range(c['episodes']):
             if (directory/'STOP').exists(): break
+            video=EpisodeVideo(directory,episode+1)
             obs,_=env.reset(seed=c['seed_start']+episode)
+            video.write(env.pixels())
             discounted=0.;power=1.
             while True:
                 action,_=model.predict(obs,deterministic=c['deterministic'])
                 obs,reward,terminated,truncated,info=env.step(action)
+                video.write(env.pixels())
                 steps+=1
                 discounted+=power*info['cost'];power*=c['gamma_cost']
                 if steps % c['log_freq']==0:
@@ -262,6 +306,7 @@ def evaluate(directory,c,env_config,model_path):
                         if isinstance(v,(int,float)):logger.record('evaluation/'+k,v)
                     logger.record('evaluation/discounted_cost_cvar',empirical_cvar([r['discounted_cost'] for r in rows],c['tail_fraction']))
                     logger.dump(steps)
+                    video.close();video=None
                     break
                 if (directory/'STOP').exists():break
             if (directory/'STOP').exists():break
@@ -272,6 +317,7 @@ def evaluate(directory,c,env_config,model_path):
         atomic_json(directory/'summary.json',summary)
         return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='eval',step=steps,episodes=len(rows),total=c['episodes'])
     finally:
+        if video is not None:video.close()
         env.close();logger.close()
 
 
@@ -288,7 +334,7 @@ def build_srairl_scenarios(c, required_split):
     return scenarios
 
 
-def create_srairl_metadrive_world(scenario,split,view_mode='topdown',reactive_background=True):
+def create_srairl_metadrive_world(scenario,split,view_mode='topdown',reactive_background=True,dynamics_mode='legacy_kinematic'):
     """Create the shared MetaDrive road/world for synchronized legacy actors."""
     from env.research_config import load_config
     from studio.visualization import StudioEnv
@@ -309,31 +355,43 @@ def create_srairl_metadrive_world(scenario,split,view_mode='topdown',reactive_ba
     # measured without prematurely terminating the legacy reference rollout.
     cfg['termination'].update(terminate_on_collision=False,terminate_on_out_of_road=False)
     cfg['dataset']={'id':scenario.scenario_id,'source':scenario.source,'clip_sha256':'canonical-interaction-scenario'}
+    if dynamics_mode=='metadrive_physics':
+        from env.tasks.srairl_metadrive_world import SRAIRLMetaDriveWorld
+        return SRAIRLMetaDriveWorld(scenario,clip,view_mode,reactive_background)
     return StudioEnv(research_config=cfg,view_mode=view_mode,dataset_clip=clip,controlled_track_ids=role_ids,
                      reactive_background=reactive_background)
 
 
 def build_srairl_envs(scenarios,c,config):
     from env.tasks.srairl_env import SRAIRLEnv
+    if c.get('scene_source','ngsim')=='procedural':
+        from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+        return [SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c['seed'],
+            c['horizon'],c.get('srairl_view','topdown'),config=config)]
     envs=[]
     for scenario in scenarios:
         world=create_srairl_metadrive_world(scenario,'train' if scenario.split=='train' else 'eval',c.get('srairl_view','topdown'),
-                                            c.get('srairl_reactive_background',True)) if c.get('metadrive_world',True) else None
-        envs.append(SRAIRLEnv(scenario,config=config,dynamics_mode='legacy_kinematic',metadrive_world=world))
+                                            c.get('srairl_reactive_background',True),c.get('dynamics_mode','legacy_kinematic')) if c.get('metadrive_world',True) else None
+        envs.append(SRAIRLEnv(scenario,config=config,dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=world))
     return envs
 
 
 def save_srairl_input_manifest(directory,c):
-    from datasets.importer import load_clip
     rows=[]
-    for item in c['srairl_scenarios']:
-        _,manifest=load_clip(item['dataset_id'])
-        rows.append({'dataset_id':item['dataset_id'],'clip_sha256':manifest['clip_sha256'],
-                     'source_sha256':manifest.get('source_sha256'), 'source':manifest['source'],
-                     'split':manifest['split'],'recording_group':manifest.get('recording_group'),
-                     'roles':item['roles']})
-    atomic_json(directory/'dataset_manifest.json',{'task':'SR-AIRL','dynamics_mode':'legacy_kinematic','metadrive_world':bool(c.get('metadrive_world',True)),
-        'reactive_background':bool(c.get('srairl_reactive_background',True)),'scenarios':rows})
+    if c.get('srairl_scenarios'):
+        from datasets.importer import load_clip
+        for item in c['srairl_scenarios']:
+            _,manifest=load_clip(item['dataset_id'])
+            rows.append({'dataset_id':item['dataset_id'],'clip_sha256':manifest['clip_sha256'],
+                         'source_sha256':manifest.get('source_sha256'), 'source':manifest['source'],
+                         'split':manifest['split'],'recording_group':manifest.get('recording_group'),
+                         'roles':item['roles']})
+    atomic_json(directory/'dataset_manifest.json',{'task':'SR-AIRL','dynamics_mode':c.get('dynamics_mode','legacy_kinematic'),'metadrive_world':bool(c.get('metadrive_world',True)),
+        'reactive_background':bool(c.get('srairl_reactive_background',True)),
+        'scene_source':c.get('scene_source','ngsim'),'scenario':c.get('scenario','straight'),
+        'lane_num':c.get('lane_num'),'traffic_density':c.get('traffic_density'),
+        'expert_dataset_id':c.get('expert_dataset_id'),
+        'expert_ngsim_scenarios':rows})
 
 
 def train_srairl(directory,c):
@@ -345,8 +403,11 @@ def train_srairl(directory,c):
     save_srairl_input_manifest(directory,c)
     scenarios=build_srairl_scenarios(c,'train')
     envs=build_srairl_envs(scenarios,c,config)
-    for env in envs:attach_srairl_frame(directory,env)
-    expert=[transition for scene in scenarios for transition in ExpertDatasetBuilder(config=config).build(scene)]
+    if c.get('expert_dataset_id'):
+        from datasets.srairl.expert_builder import load_transitions
+        expert,_=load_transitions(ROOT/c['expert_dataset_id'])
+    else:
+        expert=[transition for scene in scenarios for transition in ExpertDatasetBuilder(config=config).build(scene)]
     training=SRAIRLTrainingConfig(episodes=c['episodes'],ppo_epochs=c['ppo_epochs'],seed=c['seed'],device=c['device'])
     trainer=SRAIRLTrainer(envs,expert,config=config,training_config=training,output_dir=directory)
     recorder=Recorder(directory)
@@ -361,20 +422,135 @@ def train_srairl(directory,c):
             with (directory/'episodes.jsonl').open('a') as f:f.write(json.dumps(episode_row,allow_nan=False)+'\n')
             atomic_json(directory/'status.json',dict(state='running',kind='train',step=int(row['episode'])+1,
                 total=c['episodes'],episodes=int(row['episode'])+1,global_steps=step,device=str(trainer.device),
-                dynamics_mode='legacy_kinematic'))
+                dynamics_mode=c.get('dynamics_mode','legacy_kinematic')))
             return not (directory/'STOP').exists()
         trainer.train(callback=report)
         trainer.save()
+        saved=json.loads((directory/'config.json').read_text());saved['dynamics_mode']=c.get('dynamics_mode','legacy_kinematic')
+        saved['reactive_background']=bool(c.get('srairl_reactive_background',True))
+        saved['scene_source']=c.get('scene_source','ngsim');saved['scenario']=c.get('scenario','straight')
+        saved['lane_num']=c.get('lane_num');saved['traffic_density']=c.get('traffic_density');saved['horizon']=c.get('horizon')
+        atomic_json(directory/'config.json',saved)
         state='stopped' if (directory/'STOP').exists() else 'completed'
         summary=dict(algorithm='SR-AIRL',episodes=trainer.episode,global_steps=trainer.global_steps,
                      scenarios=[s.scenario_id for s in scenarios],expert_transitions=len(expert),
-                     dynamics_mode='legacy_kinematic',metadrive_world=bool(c.get('metadrive_world',True)),checkpoint=str(directory.relative_to(ROOT)))
+                     expert_source='MetaDrive saved demonstration' if c.get('expert_dataset_id') else 'NGSIM role-bound clips',
+                     expert_dataset_id=c.get('expert_dataset_id'),
+                     scene_source=c.get('scene_source','ngsim'),scenario=c.get('scenario','straight'),
+                     lane_num=c.get('lane_num'),traffic_density=c.get('traffic_density'),
+                     background_traffic_count=(envs[0]._last_info.get('traffic_vehicle_count') if hasattr(envs[0],'_last_info') else None),
+                     dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
+                     reactive_background=bool(c.get('srairl_reactive_background',True)),checkpoint=str(directory.relative_to(ROOT)))
         atomic_json(directory/'summary.json',summary)
         return dict(state=state,kind='train',step=trainer.episode,total=c['episodes'],episodes=trainer.episode,
                     global_steps=trainer.global_steps,device=str(trainer.device))
     finally:
         recorder.close()
         for env in envs:env.close()
+
+
+def collect_srairl_expert(directory,c):
+    """Generate reusable MetaDrive teacher trajectories for SR-AIRL training."""
+    from datasets.srairl.expert_builder import save_transitions
+    from datasets.srairl.metadrive_expert import collect_metadrive_expert
+    from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+    env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c['seed'],
+        c['horizon'],c['srairl_view'])
+    recorder=Recorder(directory)
+    try:
+        def report(state):
+            if 'episode_step' in state:
+                info=env._last_info
+                recorder.write({'demo/speed_elcv_mps':float(env.world.role_vehicle('elcv').speed),
+                    'demo/speed_rfv_mps':float(env.world.role_vehicle('rfv').speed),
+                    'demo/distance_travelled_m':float(info.get('distance_travelled_m',0.)),
+                    'demo/collision':float(info.get('metadrive_primary_collision',False)),
+                    'demo/offroad':float(info.get('metadrive_out_of_road',False))},
+                    step=int(state.get('global_steps',0)))
+            atomic_json(directory/'status.json',state)
+            return not (directory/'STOP').exists()
+        transitions,episodes=collect_metadrive_expert(env,c['demo_episodes'],c['seed'],report)
+        dataset_path=directory/'expert_transitions.npz'
+        saved_dataset=ROOT/'datasets'/'srairl'/'metadrive'/f"{directory.name}.npz"
+        pair_count=save_transitions(saved_dataset,transitions,dict(source='MetaDrive',scene_source='procedural',
+            scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
+            horizon=c['horizon'],seed=c['seed'],episodes=len(episodes),controller=c['expert_controller'],
+            state_definition='SRAIRLObservationAdapter 16D frame stacked HISTORY_LEN times; action=[longitudinal_acceleration,lateral_acceleration] in m/s^2',
+            dynamics_mode='metadrive_physics',background_traffic='MetaDrive IDM traffic manager'))
+        import shutil
+        shutil.copy2(saved_dataset,dataset_path)
+        with (directory/'episodes.jsonl').open('a') as f:
+            for row in episodes:f.write(json.dumps(row,allow_nan=False)+'\n')
+        summary=dict(task='srairl_expert_collection',source='MetaDrive',scene_source='procedural',
+            scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
+            horizon=c['horizon'],seed=c['seed'],episodes=len(episodes),transition_pairs=pair_count,
+            transitions=len(transitions),expert_controller=c['expert_controller'],
+            controller_interpretation='Rule-based headway and lane-keeping teacher; a scripted demonstration source, not an optimal or human expert.',
+            background_traffic='MetaDrive IDM traffic manager',dataset_file='expert_transitions.npz',
+            reusable_dataset=str(saved_dataset.relative_to(ROOT)),
+            dynamics_mode='metadrive_physics')
+        atomic_json(directory/'summary.json',summary)
+        state='stopped' if (directory/'STOP').exists() else 'completed'
+        return dict(state=state,kind='train',step=len(episodes),total=c['demo_episodes'],episodes=len(episodes),
+            global_steps=pair_count,device='cpu')
+    finally:
+        recorder.close();env.close()
+
+
+def evaluate_srairl_procedural(directory,c,env,policies,training):
+    """Evaluate the learned ELCV/RFV pair on a generated MetaDrive map."""
+    device=policies[0].device
+    recorder=Recorder(directory);steps=0;episode_return=0.;min_distance=float('inf')
+    collision=False;out_of_road=False;done=False;obs,_=env.reset(seed=c['seed']);info=env._last_info
+    video=EpisodeVideo(directory,1)
+    try:
+        video.write(render_srairl_frame(directory,env,info))
+        while not done and not (directory/'STOP').exists():
+            state=torch.as_tensor(obs['elcv'],dtype=torch.float32,device=device).reshape(1,-1)
+            with torch.no_grad():
+                action_e=policies[0].policy.actor(state).squeeze(0).cpu().numpy()
+                action_f=policies[1].policy.actor(state).squeeze(0).cpu().numpy()
+            obs,info=env.step({'elcv':action_e*training.action_scale,'rfv':action_f*training.action_scale})
+            video.write(render_srairl_frame(directory,env,info))
+            steps+=1;episode_return+=float(info['tracking_reward'])
+            if info['minimum_distance_m'] is not None:min_distance=min(min_distance,float(info['minimum_distance_m']))
+            collision|=bool(info['metadrive_primary_collision']);out_of_road|=bool(info['metadrive_out_of_road'])
+            done=bool(info['done'])
+            recorder.write({'step/progress_reward':float(info['tracking_reward']),
+                'step/minimum_vehicle_distance_m':float(info['minimum_distance_m'] or 0.),
+                'step/distance_travelled_m':float(info['distance_travelled_m']),
+                'step/collision':float(info['metadrive_primary_collision']),
+                'step/out_of_road':float(info['metadrive_out_of_road'])},step=steps)
+            atomic_json(directory/'status.json',dict(state='running',kind='eval',step=steps,total=c['horizon'],
+                episodes=0,global_steps=steps,dynamics_mode='metadrive_physics',device=str(device),
+                scene_source='procedural',scenario=c['scenario'],traffic_vehicle_count=info['traffic_vehicle_count']))
+        completed=not (directory/'STOP').exists()
+        row=dict(episode=1,scenario_id=f"metadrive-{c['scenario']}",scene_source='procedural',
+            map=c['scenario'],steps=steps,progress_return=episode_return,
+            distance_travelled_m=float(info['distance_travelled_m']),minimum_distance_m=None if not np.isfinite(min_distance) else min_distance,
+            collision=bool(collision),out_of_road=bool(out_of_road),
+            survival_success=bool(completed and not collision and not out_of_road),
+            traffic_vehicle_count=int(info['traffic_vehicle_count']),lane_num=c['lane_num'],
+            traffic_density=c['traffic_density'],dynamics_mode='metadrive_physics')
+        if completed:
+            with (directory/'episodes.jsonl').open('a') as f:f.write(json.dumps(row,allow_nan=False)+'\n')
+            recorder.write({'evaluation/progress_return':episode_return,'evaluation/distance_travelled_m':row['distance_travelled_m'],
+                'evaluation/collision_rate':float(collision),'evaluation/out_of_road_rate':float(out_of_road),
+                'evaluation/survival_success_rate':float(row['survival_success']),
+                **({'evaluation/minimum_distance_m':row['minimum_distance_m']} if row['minimum_distance_m'] is not None else {})},step=steps)
+        summary=dict(algorithm='SR-AIRL',episodes=int(completed),global_steps=steps,
+            scene_source='procedural',scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
+            background_traffic_count=row['traffic_vehicle_count'],dynamics_mode='metadrive_physics',
+            progress_return=episode_return if completed else None,distance_travelled_m=row['distance_travelled_m'] if completed else None,
+            collision_rate=float(collision) if completed else None,out_of_road_rate=float(out_of_road) if completed else None,
+            survival_success_rate=float(row['survival_success']) if completed else None,
+            minimum_distance_m=row['minimum_distance_m'] if completed else None,
+            interpretation='Two SR-AIRL policy actors were evaluated on a generated MetaDrive map with simulator traffic. Background vehicles are traffic policies, not additional SR-AIRL learned actors; this is cross-map evaluation, not NGSIM trajectory tracking.')
+        atomic_json(directory/'summary.json',summary)
+        return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='eval',step=steps,
+                    total=c['horizon'],episodes=int(completed),global_steps=steps,device=str(device))
+    finally:
+        video.close();recorder.close();env.close()
 
 
 def evaluate_srairl(directory,c):
@@ -385,30 +561,40 @@ def evaluate_srairl(directory,c):
     if not path.is_dir() or path.parent!=(ROOT/'models').resolve() and (ROOT/'models'/'srairl').resolve() not in path.parents:
         raise ValueError('SR-AIRL model path is outside models/')
     saved=json.loads((path/'config.json').read_text())
+    saved_dynamics=saved.get('dynamics_mode','legacy_kinematic')
+    if saved_dynamics!=c.get('dynamics_mode',saved_dynamics):
+        raise ValueError(f"评估动力学 {c.get('dynamics_mode')} 与模型训练动力学 {saved_dynamics} 不一致")
     config=SRAIRLConfig.from_mapping(saved['srairl'])
     train_cfg_values=dict(saved['training']);train_cfg_values['device']=c['device']
     training=SRAIRLTrainingConfig(**train_cfg_values)
     policies=SRAIRLTrainer.load_policies(path,config,training,device=c['device'] if c['device']!='auto' else ('cuda' if torch.cuda.is_available() else 'cpu'))
+    if c.get('scene_source')=='procedural':
+        from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+        env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c['seed'],c['horizon'],c.get('srairl_view','topdown'),config=config)
+        save_srairl_input_manifest(directory,c);return evaluate_srairl_procedural(directory,c,env,policies,training)
     scenarios=build_srairl_scenarios(c,'eval')
     save_srairl_input_manifest(directory,c)
     scenario=scenarios[0];env=build_srairl_envs(scenarios,c,config)[0]
-    attach_srairl_frame(directory,env)
     device=policies[0].device
     recorder=Recorder(directory);episode_rows=[];steps=0;returns=0.;errors=[];actor_errors={scenario.elcv_id:[],scenario.rfv_id:[]};collisions=0
-    min_distance=float('inf');min_ttc=float('inf');metadrive_collision=False
+    video=EpisodeVideo(directory,1)
+    min_distance=float('inf');min_ttc=float('inf');metadrive_collision=False;metadrive_out_of_road=False
     try:
         obs,_=env.reset();episode_return=0.;episode_errors=[];collision=False
+        video.write(render_srairl_frame(directory,env,env._last_info))
         while True:
             state=torch.as_tensor(obs['elcv'],dtype=torch.float32,device=device).reshape(1,-1)
             with torch.no_grad():
                 action_e=policies[0].policy.actor(state).squeeze(0).cpu().numpy()
                 action_f=policies[1].policy.actor(state).squeeze(0).cpu().numpy()
             obs,info=env.step({'elcv':action_e*training.action_scale,'rfv':action_f*training.action_scale})
+            video.write(render_srairl_frame(directory,env,info))
             steps+=1;episode_return+=info['tracking_reward']
             episode_errors.extend(info['position_errors_m'].values())
             for ident,value in info['position_errors_m'].items():actor_errors.setdefault(ident,[]).append(float(value))
             collision=collision or info['collision_proxy_any']
             metadrive_collision=metadrive_collision or info['metadrive_primary_collision']
+            metadrive_out_of_road=metadrive_out_of_road or info['metadrive_out_of_road']
             if info['min_interaction_clearance_m'] is not None:
                 min_distance=min(min_distance,float(info['min_interaction_clearance_m']))
             if info['min_interaction_ttc_s'] is not None:min_ttc=min(min_ttc,float(info['min_interaction_ttc_s']))
@@ -417,7 +603,7 @@ def evaluate_srairl(directory,c):
                 'step/controlled_separation_m':info['controlled_separation_m'],
                 **({'step/min_interaction_ttc_s':info['min_interaction_ttc_s']} if info['min_interaction_ttc_s'] is not None else {})},step=steps)
             atomic_json(directory/'status.json',dict(state='running',kind='eval',step=steps,total=max(1,int(round((env.episode_end_time-env.start_time)/env.dt))),
-                episodes=0,global_steps=steps,dynamics_mode='legacy_kinematic',device=str(device)))
+                episodes=0,global_steps=steps,dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),device=str(device)))
             if info['done'] or (directory/'STOP').exists():break
         if not (directory/'STOP').exists():
             rmse=float(np.mean(episode_errors)) if episode_errors else None
@@ -430,7 +616,8 @@ def evaluate_srairl(directory,c):
                      collision_proxy_any=bool(collision),controlled_pair_collision_proxy=bool(info['controlled_collision_proxy']),
                      success=bool(env.time>=env.episode_end_time-env.dt*.51),
                      metadrive_primary_collision=bool(metadrive_collision),
-                     dynamics_mode='legacy_kinematic',metadrive_world=bool(c.get('metadrive_world',True)),
+                     metadrive_out_of_road=bool(metadrive_out_of_road),
+                     dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
                      traffic_reactive=bool(c.get('srairl_reactive_background',True)))
             episode_rows.append(row);errors=episode_errors;returns=episode_return;collisions=int(collision)
             with (directory/'episodes.jsonl').open('a') as f:f.write(json.dumps(row,allow_nan=False)+'\n')
@@ -440,6 +627,7 @@ def evaluate_srairl(directory,c):
                             'evaluation/collision_proxy_rate':float(collision),
                             'evaluation/controlled_pair_collision_proxy_rate':float(info['controlled_collision_proxy']),
                             'evaluation/metadrive_primary_collision_rate':float(metadrive_collision),
+                            'evaluation/metadrive_out_of_road_rate':float(metadrive_out_of_road),
                             'evaluation/success_rate':float(row['success'])},step=steps)
             if row['minimum_ttc_s'] is not None:recorder.write({'evaluation/minimum_ttc_s':row['minimum_ttc_s']},step=steps)
         summary=dict(algorithm='SR-AIRL',episodes=len(episode_rows),global_steps=steps,
@@ -451,17 +639,137 @@ def evaluate_srairl(directory,c):
                      collision_proxy_rate=float(collisions) if episode_rows else None,
                      controlled_pair_collision_proxy_rate=float(episode_rows[0]['controlled_pair_collision_proxy']) if episode_rows else None,
                      metadrive_primary_collision_rate=float(metadrive_collision) if episode_rows else None,
+                     metadrive_out_of_road_rate=float(metadrive_out_of_road) if episode_rows else None,
                      success_rate=float(episode_rows[0]['success']) if episode_rows else None,
-                     scenario_id=scenario.scenario_id,dynamics_mode='legacy_kinematic',metadrive_world=bool(c.get('metadrive_world',True)),
+                     scenario_id=scenario.scenario_id,dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
                      traffic_reactive=bool(c.get('srairl_reactive_background',True)),collision_metric='axis_aligned_proxy',
                      background_dynamics='bounded IDM-like longitudinal response around recorded NGSIM reference; not calibrated human-driver dynamics',
-                     result_interpretation='MetaDrive NGSIM reconstruction with two policy-controlled legacy-kinematic actors and reactive background replay; not calibrated MetaDrive vehicle physics or validated interactive traffic.')
+                     result_interpretation=('Both SR-AIRL actors use MetaDrive vehicle physics; the acceleration-to-control mapping is calibrated only around 10 m/s, and the background response model is not fitted to human-driver data.'
+                         if c.get('dynamics_mode')=='metadrive_physics' else
+                         'MetaDrive NGSIM reconstruction with policy-controlled upstream kinematic actors and reactive background replay; not vehicle-physics closed loop.'))
         atomic_json(directory/'summary.json',summary)
         return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='eval',step=steps,total=steps,
                     episodes=len(episode_rows),global_steps=steps,device=str(device))
     finally:
-        recorder.close()
+        video.close();recorder.close()
         env.close()
+
+
+def train_reward_guide(directory, c):
+    stage = ROOT/'rl/srairl/upstream/Step3_Reward_Guide'
+    device = c['device']
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    command = [sys.executable, '-u', str(stage/'main.py'),
+               '--device', device, '--total_epoch', str(c['epochs']),
+               '--batch_size', str(c['batch_size']), '--seed', str(c['seed']),
+               '--data_path', str(ROOT/'rl/srairl/upstream/data/sample_data.pkl'),
+               '--output_dir', str(directory), '--studio_dir', str(directory),
+               '--srairl_model', c['srairl_model_path']]
+    completed = subprocess.run(command, cwd=stage, check=False)
+    if completed.returncode:
+        raise RuntimeError(f"upstream reward-guide process exited with code {completed.returncode}")
+    summary_path = directory/'summary.json'
+    if not summary_path.is_file():
+        raise RuntimeError('upstream reward-guide process exited without a selected checkpoint summary')
+    summary=json.loads(summary_path.read_text(encoding='utf-8'))
+    summary.update(seed=c['seed'],device=device,epochs=c['epochs'],batch_size=c['batch_size'],
+                   srairl_model_id=c['srairl_model_id'])
+    atomic_json(summary_path,summary)
+    write_upstream_runtime_metadata(directory,'reward_guide',c,device)
+    return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='train',
+                step=int(summary.get('best_epoch') or 0)+1,total=c['epochs'],episodes=0,device=device)
+
+
+def train_srairl_predictor(directory, c):
+    stage = ROOT/'rl/srairl/upstream/Step4_Predictor'
+    device = c['device']
+    if device == 'auto':
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    command = [sys.executable, '-u', str(stage/'main.py'),
+               '--device', device, '--total_epoch', str(c['epochs']),
+               '--batch_size', str(c['batch_size']), '--seed', str(c['seed']),
+               '--data_path', str(ROOT/'rl/srairl/upstream/data/sample_data.pkl'),
+               '--output_dir', str(directory), '--studio_dir', str(directory),
+               '--reward_guide_path', c['reward_guide_path']]
+    completed = subprocess.run(command, cwd=stage, check=False)
+    if completed.returncode:
+        raise RuntimeError(f"upstream predictor process exited with code {completed.returncode}")
+    summary_path=directory/'summary.json'
+    if not summary_path.is_file():
+        raise RuntimeError('upstream predictor exited without a validation-selected checkpoint summary')
+    summary=json.loads(summary_path.read_text(encoding='utf-8'))
+    summary.update(seed=c['seed'],device=device,epochs=c['epochs'],batch_size=c['batch_size'],
+                   reward_guide_model_id=c['reward_guide_model_id'])
+    atomic_json(summary_path,summary)
+    write_upstream_runtime_metadata(directory,'predictor',c,device)
+    return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='train',
+                step=int(summary.get('best_epoch') or 0)+1,total=c['epochs'],episodes=0,device=device)
+
+
+def train_upstream_planner(directory, c):
+    stage=ROOT/'rl/srairl/upstream/Step2_Planner'
+    device=c['device']
+    if device=='auto':device='cuda' if torch.cuda.is_available() else 'cpu'
+    data_path=str(ROOT/'rl/srairl/upstream/data/sample_data.pkl')
+    goal_dir=directory/'planner_goal';dppo_dir=directory/'planner_dppo'
+    atomic_json(directory/'status.json',dict(state='running',kind='train',step=0,total=c['goal_epochs'],
+        episodes=0,device=device,phase='planner_goal'))
+    goal_command=[sys.executable,'-u',str(stage/'train_goal.py'),'--device',device,
+        '--data_path',data_path,'--output_dir',str(goal_dir),'--studio_dir',str(directory),
+        '--epochs',str(c['goal_epochs']),'--seed',str(c['seed'])]
+    if subprocess.run(goal_command,cwd=stage,check=False).returncode:
+        raise RuntimeError('upstream goal-predictor training failed')
+    if (directory/'STOP').exists():
+        summary={'task':'planner','algorithm':'SR-AIRL Diffusion Planner',
+            'goal_predictor':json.loads((directory/'planner_goal_summary.json').read_text(encoding='utf-8')),
+            'diffusion_planner':None,'seed':c['seed'],'device':device,
+            'interpretation':'Stopped after goal-predictor stage; no DPPO diffusion checkpoint was produced.'}
+        atomic_json(directory/'summary.json',summary)
+        write_upstream_runtime_metadata(directory,'planner',c,device)
+        return dict(state='stopped',kind='train',step=0,total=c['dppo_steps'],episodes=0,device=device)
+    atomic_json(directory/'status.json',dict(state='running',kind='train',step=0,total=c['dppo_steps'],
+        episodes=0,device=device,phase='planner_dppo'))
+    dppo_command=[sys.executable,'-u',str(stage/'train_dppo.py'),'--device',device,
+        '--data_path',data_path,'--output_dir',str(dppo_dir),'--studio_dir',str(directory),
+        '--steps',str(c['dppo_steps']),'--batch_size',str(c['batch_size']),'--seed',str(c['seed'])]
+    if subprocess.run(dppo_command,cwd=stage,check=False).returncode:
+        raise RuntimeError('upstream DPPO planner training failed')
+    goal=json.loads((directory/'planner_goal_summary.json').read_text(encoding='utf-8'))
+    dppo=json.loads((directory/'planner_dppo_summary.json').read_text(encoding='utf-8'))
+    summary={'task':'planner','algorithm':'SR-AIRL Diffusion Planner',
+        'goal_predictor':goal,'diffusion_planner':dppo,'dataset':data_path,'seed':c['seed'],
+        'device':device,'upstream_revision':'a762fd1c4099ce27eda1fa4f26372c007fab0129',
+        'interpretation':'Planner model training on the upstream fixed NGSIM trajectory dataset; closed-loop MetaDrive evaluation is not included in this stage.'}
+    atomic_json(directory/'summary.json',summary)
+    write_upstream_runtime_metadata(directory,'planner',c,device)
+    return dict(state='stopped' if (directory/'STOP').exists() else 'completed',kind='train',
+        step=int(dppo.get('steps',0)),total=c['dppo_steps'],episodes=0,device=device)
+
+
+def write_upstream_runtime_metadata(directory, task, c, device):
+    dataset=ROOT/'rl/srairl/upstream/data/sample_data.pkl'
+    checkpoint=c.get('srairl_model_path') or c.get('reward_guide_path')
+    inputs=[]
+    if checkpoint:
+        checkpoint_path=Path(checkpoint).resolve()
+        checkpoint_files=sorted(checkpoint_path.glob('*.pt')) if checkpoint_path.is_dir() else [checkpoint_path]
+        for item in checkpoint_files:
+            if item.is_file():
+                inputs.append({'path':str(item),'sha256':hashlib.sha256(item.read_bytes()).hexdigest()})
+    versions={}
+    for package in ('torch','numpy','pandas','einops','tensorboard'):
+        try:versions[package]=importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:versions[package]=None
+    metadata={'task':task,'upstream_repository':'https://github.com/cixinachu/SR-AIRL',
+        'upstream_revision':'a762fd1c4099ce27eda1fa4f26372c007fab0129','device':device,
+        'seed':c['seed'],'dataset':{'path':str(dataset.relative_to(ROOT)),
+            'sha256':hashlib.sha256(dataset.read_bytes()).hexdigest(),
+            'records':203,'train_records':150,'validation_records':53,
+            'validation_note':'The upstream code calls this partition test; it is used for checkpoint selection here.'},
+        'input_checkpoints':inputs,
+        'versions':versions}
+    atomic_json(directory/'runtime_metadata.json',metadata)
 
 
 def main():
@@ -470,12 +778,19 @@ def main():
     torch.set_num_threads(1)
     atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
     try:
+        if job.get('task') in ('planner','reward_guide','predictor'):
+            result=(train_upstream_planner(directory,c) if job['task']=='planner' else
+                    train_reward_guide(directory,c) if job['task']=='reward_guide' else
+                    train_srairl_predictor(directory,c))
+            atomic_json(directory/'status.json',result)
+            return
         if job.get('task')=='srairl':
             c=job['settings']
-            atomic_json(directory/'runtime_metadata.json',dict(task='SR-AIRL',dynamics_mode='legacy_kinematic',metadrive_world=bool(c.get('metadrive_world',True)),
+            atomic_json(directory/'runtime_metadata.json',dict(task='SR-AIRL',dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
                 source_sha256={str(f.relative_to(ROOT)):hashlib.sha256(f.read_bytes()).hexdigest()
                     for folder in ('env','rl','datasets','studio') for f in (ROOT/folder).rglob('*.py')}))
-            result=train_srairl(directory,c) if kind=='train' else evaluate_srairl(directory,c)
+            if c.get('operation')=='expert_collect':result=collect_srairl_expert(directory,c)
+            else:result=train_srairl(directory,c) if kind=='train' else evaluate_srairl(directory,c)
             atomic_json(directory/'status.json',result)
             return
         cfg=environment_config(c,kind)
@@ -490,8 +805,10 @@ def main():
             model_sha256=hashlib.sha256(Path(job['model_path']).read_bytes()).hexdigest() if job.get('model_path') else None)
         atomic_json(directory/'runtime_metadata.json',metadata)
         if kind=='preview':
-            env=ViewEnv(StudioEnv(research_config=cfg, view_mode=c.get('view_mode','topdown')),directory,.1,overview=True)
-            try:env.reset(seed=c['seed_start'])
+            env=ViewEnv(StudioEnv(research_config=cfg, view_mode=c.get('view_mode','topdown'), preview=True),directory,.1,overview=True)
+            try:
+                env.reset(seed=c['seed_start'])
+                env.frame(force=True)
             finally:env.close()
             result=dict(state='completed',kind=kind,step=0)
         elif kind=='train':result=train(directory,c,cfg)

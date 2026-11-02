@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+from pathlib import Path
+import tempfile
 
 from env.core.types import InteractionScenario
 from env.adapters.srairl_observation import SRAIRLObservationAdapter
@@ -7,8 +9,8 @@ from env.tasks.srairl_env import SRAIRLEnv
 from tasks.registry import TASK_REGISTRY
 
 
-def scenario():
-    times = np.arange(-.1, .41, .1)
+def scenario(duration=.4):
+    times = np.arange(-.2, duration+.01, .1)
     def track(ident, x_offset, y_offset):
         states = [[t, x_offset + 10*t, y_offset, 10., 0.] for t in times]
         return {"id": ident, "states": states, "length": 4.5, "width": 1.8}
@@ -34,6 +36,14 @@ def test_observation_reproduces_upstream_16d_relative_frame_and_history_padding(
     assert np.allclose(frame[4:8], adapter.normalize_vehicle(roles["elcv"]) - adapter.normalize_vehicle(roles["rfv"]))
 
 
+def test_srairl_kinematics_matches_upstream_backward_differences():
+    from datasets.srairl.kinematics import acceleration, state
+    times=np.arange(-.2,.31,.1)
+    track={"id":"known-motion","states":[[t,20.+10.*t+2.*t*t,3.,0.,0.] for t in times]}
+    assert state(track,0.)[2] == pytest.approx(9.8)
+    assert acceleration(track,0.)[0] == pytest.approx(4.)
+
+
 def test_legacy_environment_uses_updated_velocity_for_position_and_joint_obs():
     env = SRAIRLEnv(scenario(), history_len=1)
     obs, info = env.reset()
@@ -46,9 +56,31 @@ def test_legacy_environment_uses_updated_velocity_for_position_and_joint_obs():
     assert info["dynamics_mode"] == "legacy_kinematic"
 
 
-def test_physics_mode_is_not_misrepresented_as_implemented():
-    with pytest.raises(NotImplementedError, match="synchronization"):
+def test_physics_mode_requires_a_real_two_agent_metadrive_world():
+    with pytest.raises(ValueError, match="two-agent MetaDrive world"):
         SRAIRLEnv(scenario(), dynamics_mode="metadrive_physics")
+
+
+def test_metadrive_physics_controls_both_interaction_actors():
+    from studio.worker import create_srairl_metadrive_world
+    scene=scenario(.8)
+    world=create_srairl_metadrive_world(scene,"train","topdown",True,"metadrive_physics")
+    env=SRAIRLEnv(scene,dynamics_mode="metadrive_physics",metadrive_world=world)
+    try:
+        env.reset()
+        assert world.is_multi_agent and set(world.agents)=={"agent0","agent1"}
+        before={role:env.vehicles[ident]["lon"] for role,ident in (("elcv",scene.elcv_id),("rfv",scene.rfv_id))}
+        before_speed={role:env.vehicles[ident]["v_long"] for role,ident in (("elcv",scene.elcv_id),("rfv",scene.rfv_id))}
+        for _ in range(5):
+            _,info=env.step({"elcv":[1.,0.],"rfv":[-1.,0.]})
+        assert env.vehicles[scene.elcv_id]["lon"]>before["elcv"]
+        assert env.vehicles[scene.rfv_id]["lon"]>before["rfv"]
+        assert env.vehicles[scene.elcv_id]["v_long"]>env.vehicles[scene.rfv_id]["v_long"]
+        assert (env.vehicles[scene.elcv_id]["v_long"]-before_speed["elcv"])/.5 == pytest.approx(1.,abs=.35)
+        assert (env.vehicles[scene.rfv_id]["v_long"]-before_speed["rfv"])/.5 == pytest.approx(-1.,abs=.5)
+        assert info["dynamics_mode"]=="metadrive_physics"
+    finally:
+        env.close()
 
 
 def test_legacy_controlled_pair_synchronizes_to_shared_metadrive_world():
@@ -89,6 +121,9 @@ def test_reactive_recorded_traffic_changes_speed_when_policy_vehicle_closes_gap(
 def test_task_registry_keeps_algorithm_family_separate():
     assert TASK_REGISTRY["safe_rl"].status == "available"
     assert TASK_REGISTRY["srairl"].status == "available"
+    assert TASK_REGISTRY["planner"].status == "available"
+    assert TASK_REGISTRY["reward_guide"].status == "available"
+    assert TASK_REGISTRY["predictor"].status == "available"
 
 
 def test_social_airl_discriminator_uses_checked_upstream_reward_shape():
@@ -115,6 +150,53 @@ def test_social_potential_denormalizes_velocity_with_the_supplied_offset():
     assert [float(v.item()) for v in physical] == pytest.approx([5.,200.,0.,0.])
 
 
+def test_srairl_state_dict_checkpoint_loads_as_upstream_reward_guide():
+    torch = pytest.importorskip("torch")
+    import json
+    from rl.srairl.config import SRAIRLConfig
+    from rl.srairl.discriminator import AnisotropicInteractionPotential, SocialAIRLDiscrim
+    from rl.srairl.upstream.adapter import load_reward_discriminator
+    cfg = SRAIRLConfig.from_mapping()
+    dim = cfg.frame_state_dim * cfg.history_len
+    potential = AnisotropicInteractionPotential(cfg.potential_longitudinal_scale,
+        cfg.potential_lateral_scale, cfg.direction_lambda, pos_lat_scale=cfg.pos_lat_scale,
+        pos_long_scale=cfg.pos_long_scale, vel_scale=cfg.vel_scale, vel_offset=cfg.vel_offset)
+    model = SocialAIRLDiscrim(dim, cfg.gamma, potential, cfg.alpha_init, role="fv",
+                              history_len=cfg.history_len)
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp)
+        (path / "config.json").write_text(json.dumps({"algorithm": "SR-AIRL", "srairl": cfg.__dict__}))
+        torch.save(model.state_dict(), path / "discriminator_rfv.pt")
+        restored = load_reward_discriminator(path, "cpu")
+        reward = restored.get_reward(torch.zeros((2, dim)))[0]
+        assert reward.shape == (2, 1)
+        assert not restored.training
+
+
+def test_reward_guide_request_requires_a_prior_srairl_model():
+    from studio.config import clean_reward_guide_request
+    with pytest.raises(ValueError, match="选择已完成"):
+        clean_reward_guide_request({}, "train")
+    config = clean_reward_guide_request({"srairl_model_id": "models/example",
+        "upstream_epochs": 2, "upstream_batch_size": 4, "upstream_seed": 5,
+        "upstream_device": "cpu"}, "train")
+    assert config["task"] == "reward_guide"
+    assert config["epochs"] == 2
+
+
+def test_upstream_planner_and_predictor_requests_validate_stage_inputs():
+    from studio.config import clean_planner_request, clean_predictor_request
+    planner = clean_planner_request({"planner_goal_epochs": 2, "planner_dppo_steps": 3,
+        "upstream_batch_size": 4, "upstream_seed": 5, "upstream_device": "cpu"}, "train")
+    assert (planner["goal_epochs"], planner["dppo_steps"]) == (2, 3)
+    with pytest.raises(ValueError, match="闭环评估接口"):
+        clean_planner_request({}, "eval")
+    predictor = clean_predictor_request({"reward_guide_model_id": "models/guide",
+        "upstream_epochs": 2, "upstream_batch_size": 4, "upstream_seed": 5,
+        "upstream_device": "cpu"}, "train")
+    assert predictor["task"] == "predictor"
+
+
 def test_expert_builder_keeps_two_actor_actions_separate_and_requires_preroll():
     from datasets.srairl.expert_builder import ExpertDatasetBuilder
     transitions = ExpertDatasetBuilder(history_len=2).build(scenario())
@@ -138,7 +220,7 @@ def test_supplied_reward_config_values_are_the_sr_airl_defaults():
 def test_studio_srairl_request_requires_explicit_distinct_ngsim_roles(monkeypatch):
     from studio.config import clean_srairl_request
     import datasets.importer
-    times=np.arange(-.1,.41,.1)
+    times=np.arange(-.2,.41,.1)
     offsets=[(0,3),(-10,3),(15,3),(15,6.5)]
     tracks=[{"id":str(i),"states":[[t,x+10*t,y,10.,0.] for t in times],"length":4.5,"width":1.8}
             for i,(x,y) in enumerate(offsets)]
@@ -147,7 +229,7 @@ def test_studio_srairl_request_requires_explicit_distinct_ngsim_roles(monkeypatc
     request=clean_srairl_request({"srairl_scenarios":[{"dataset_id":"a"*24,"roles":{
         "elcv_id":"0","rfv_id":"1","rlv_current_id":"2","rlv_target_id":"3"}}],
         "srairl_episodes":2,"srairl_ppo_epochs":2,"srairl_seed":0,"srairl_device":"cpu"},"train")
-    assert request["dynamics_mode"]=="legacy_kinematic"
+    assert request["dynamics_mode"]=="metadrive_physics"
     with pytest.raises(ValueError,match="不同轨迹"):
         clean_srairl_request({"srairl_scenarios":[{"dataset_id":"a"*24,"roles":{
             "elcv_id":"0","rfv_id":"0","rlv_current_id":"2","rlv_target_id":"3"}}]},"train")

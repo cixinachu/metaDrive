@@ -11,6 +11,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 STORE = ROOT/'datasets/processed'
+_CATALOG_CACHE = {}
 NGSIM_COLUMNS = 'vehicle_id frame_id total_frames global_time local_x local_y global_x global_y v_length v_width v_class v_vel v_acc lane_id preceding following space_headway time_headway'.split()
 
 
@@ -37,10 +38,18 @@ def digest(path):
 
 
 def catalog(store=STORE):
+    store=Path(store)
+    try:directory_mtime=store.stat().st_mtime_ns
+    except FileNotFoundError:return []
+    key=str(store.resolve())
+    cached=_CATALOG_CACHE.get(key)
+    if cached and cached[0]==directory_mtime:return [dict(row) for row in cached[1]]
     result=[]
-    for p in sorted(Path(store).glob('*/manifest.json')):
-        result.append(json.loads(p.read_text(encoding="utf-8")))
-    return result
+    for p in sorted(store.glob('*/manifest.json')):
+        try:result.append(json.loads(p.read_text(encoding="utf-8")))
+        except (OSError,json.JSONDecodeError):continue
+    _CATALOG_CACHE[key]=(directory_mtime,result)
+    return [dict(row) for row in result]
 
 
 def load_clip(identifier, store=STORE):
@@ -120,7 +129,10 @@ def import_clip(options, store=STORE):
     for r in rows(path):
         if not eligible(r): continue
         ident,t,x,y,length,width=decode(r)
-        if not start-1/fps<=t<=end+1/fps: continue
+        # SR-AIRL expert velocity/acceleration labels use two backward 100 ms
+        # differences. Preserve that pre-roll in the canonical clip rather than
+        # inventing zero or gradient labels at the selected episode boundary.
+        if not start-2/fps<=t<=end+1/fps: continue
         if not all(math.isfinite(v) for v in (t,x,y,length,width)) or length<=0 or width<=0: raise ValueError('发现非有限数值或无效车辆尺寸')
         tracks.setdefault(ident,[]).append([t,x,y,length,width])
     segments=[]

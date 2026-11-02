@@ -24,6 +24,7 @@ class InteractionScenario:
     lane_change_start: Optional[float] = None
     lane_change_end: Optional[float] = None
     start_time: float = 0.0
+    end_time: Optional[float] = None
 
     def __post_init__(self):
         if not self.scenario_id or not self.source:
@@ -46,6 +47,8 @@ class InteractionScenario:
             raise ValueError("lane-change start and end must be supplied together")
         if self.lane_change_start is not None and self.lane_change_end < self.lane_change_start:
             raise ValueError("lane-change end precedes start")
+        if self.end_time is not None and self.end_time <= self.start_time:
+            raise ValueError("end_time must follow start_time")
 
     @classmethod
     def from_clip(cls, clip, manifest, *, elcv_id, rfv_id, rlv_current_id=None,
@@ -60,5 +63,5 @@ class InteractionScenario:
             lane_num=int(clip["lane_num"]), lane_width=float(clip["lane_width"]),
             road_length=float(clip["road_length"]), split=manifest["split"],
             source=manifest["source"], lane_change_start=lane_change_start,
-            lane_change_end=lane_change_end,
+            lane_change_end=lane_change_end,end_time=float(clip["duration"]) if clip.get("duration") else None,
         )

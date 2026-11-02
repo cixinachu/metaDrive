@@ -15,7 +15,7 @@ import time
 import zipfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,clean_srairl_request,atomic_json
+from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,clean_srairl_request,clean_reward_guide_request,clean_predictor_request,clean_planner_request,atomic_json
 from tasks.registry import TASK_REGISTRY
 
 from rl.algorithms import metadata as algorithm_metadata
@@ -55,7 +55,32 @@ def srairl_model_catalog():
         meta=read_json(p,{}) or {}
         if meta.get('algorithm')!='SR-AIRL' or not (p.parent/'policy_elcv.pt').is_file() or not (p.parent/'policy_rfv.pt').is_file():continue
         result.append(dict(id=str(p.parent.relative_to(ROOT)),label=f"SR-AIRL · {p.parent.name}",path=str(p.parent.relative_to(ROOT)),
-                           episode=meta.get('episode',0),global_steps=meta.get('global_steps',0)))
+                           episode=meta.get('episode',0),global_steps=meta.get('global_steps',0),
+                           dynamics_mode=meta.get('dynamics_mode','legacy_kinematic')))
+    return result
+
+
+def srairl_expert_catalog():
+    result=[]
+    for path in sorted((ROOT/'datasets'/'srairl'/'metadrive').glob('*.npz'),key=lambda p:p.stat().st_mtime,reverse=True):
+        try:
+            import numpy as np
+            with np.load(path,allow_pickle=False) as data:metadata=json.loads(str(data['metadata'].item()))
+            result.append(dict(id=str(path.relative_to(ROOT)),label=f"MetaDrive 示范 · {metadata.get('scenario','?')} · {metadata.get('transition_pairs',0)} 对",
+                path=str(path.relative_to(ROOT)),transition_pairs=metadata.get('transition_pairs',0),scenario=metadata.get('scenario'),
+                controller=metadata.get('controller'),seed=metadata.get('seed')))
+        except Exception:
+            continue
+    return result
+
+
+def reward_guide_model_catalog():
+    result=[]
+    for p in sorted((ROOT/'models').glob('*/results/best_model.pth'),key=lambda p:p.stat().st_mtime,reverse=True):
+        meta=read_json(p.parents[1]/'summary.json',{}) or {}
+        if meta.get('task')!='reward_guide':continue
+        result.append(dict(id=str(p.parents[1].relative_to(ROOT)),label=f"SR-AIRL Reward Guide · {p.parents[1].name}",
+                           path=str(p.relative_to(ROOT)),bytes=p.stat().st_size,metrics=meta.get('metrics',{})))
     return result
 
 
@@ -130,6 +155,34 @@ def start_job(kind,raw):
                 PROCESS=subprocess.Popen([sys.executable,'-u',str(ROOT/'studio/worker.py'),'--job',str(directory)],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
             ACTIVE=name
             return {'id':name}
+    if task in ('planner','reward_guide','predictor'):
+        if task=='planner':
+            c=clean_planner_request(raw,kind)
+        elif task=='reward_guide':
+            c=clean_reward_guide_request(raw,kind)
+            selected=next((m for m in srairl_model_catalog() if m['id']==c['srairl_model_id']),None)
+            if selected is None:raise ValueError('请选择包含 SR-AIRL 策略与判别器检查点的已完成模型')
+            c['srairl_model_path']=str((ROOT/selected['path']).resolve())
+        else:
+            c=clean_predictor_request(raw,kind)
+            selected=next((m for m in reward_guide_model_catalog() if m['id']==c['reward_guide_model_id']),None)
+            if selected is None:raise ValueError('请选择包含验证集最优检查点的已完成奖励引导器模型')
+            c['reward_guide_path']=str((ROOT/selected['path']).resolve())
+        with LOCK:
+            if PROCESS is not None and PROCESS.poll() is None:
+                previous=read_json(job_dir(ACTIVE)/'status.json',{})
+                if previous.get('state') in ('completed','stopped','failed'):
+                    try:PROCESS.wait(timeout=5)
+                    except subprocess.TimeoutExpired:raise ValueError('上一个任务正在释放资源，请稍后再试。')
+                else:raise ValueError('已有任务运行中。请先停止或等待完成。')
+            name=f'{time.strftime("%Y%m%d_%H%M%S")}_{kind}_{time.time_ns()%1000000:06d}'
+            directory=run_root(kind)/name;directory.mkdir(parents=True)
+            atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c))
+            atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
+            with (directory/'worker.log').open('w') as log:
+                PROCESS=subprocess.Popen([sys.executable,'-u',str(ROOT/'studio/worker.py'),'--job',str(directory)],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
+            ACTIVE=name
+            return {'id':name}
     if task != 'safe_rl':raise ValueError('当前任务暂不可由 Studio 启动')
     c=clean_request(raw,kind)
     model=None
@@ -182,7 +235,9 @@ class Handler(BaseHTTPRequestHandler):
     def get(self):
         parsed=urlparse(self.path);path=parsed.path;q=parse_qs(parsed.query)
         if path=='/api/catalog':
-            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),datasets=dataset_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{})))
+            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_expert_datasets=srairl_expert_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{})))
+        if path=='/api/datasets/catalog':
+            return self.respond(dataset_catalog())
         if path=='/api/jobs':
             jobs=[]
             for p in sorted((p for root in JOB_ROOTS for p in root.glob('*') if p.is_dir() and (p/'request.json').exists()),key=lambda p:p.name,reverse=True):
@@ -195,6 +250,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(dict(id=identifier,source=manifest['source'],split=manifest['split'],tracks=[dict(id=str(t['id']),ego=bool(t.get('ego')),states=len(t.get('states',[]))) for t in clip.get('tracks',[])]))
         if path.startswith('/api/jobs/'):
             parts=path.split('/');directory=job_dir(parts[3]);action=parts[4] if len(parts)>4 else ''
+            if action=='videos':
+                return self.respond({'videos':[p.name for p in sorted((directory/'videos').glob('*.mp4'))]})
             if action=='frame':
                 p=directory/'frame.jpg'
                 return self.respond(p.read_bytes(),content_type='image/jpeg')
@@ -206,6 +263,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(dict(id=directory.name,status=status(directory),request=read_json(directory/'request.json',{}),
                 summary=read_json(directory/'summary.json'),episodes=LOG_CACHE.read(directory/'episodes.jsonl'),log=tail_text(log)))
         files={'/':'index.html','/app.js':'app.js','/style.css':'style.css'}
+        if path=='/run':
+            p=ROOT/'studio/static'/'run.html'
+            return self.respond(p.read_bytes(),content_type='text/html; charset=utf-8')
+        if path=='/run.js':
+            p=ROOT/'studio/static'/'run.js'
+            return self.respond(p.read_bytes(),content_type='text/javascript; charset=utf-8')
         if path in files:
             p=ROOT/'studio/static'/files[path]
             return self.respond(p.read_bytes(),content_type=mimetypes.guess_type(p.name)[0] or 'text/plain')
@@ -225,7 +288,27 @@ class Handler(BaseHTTPRequestHandler):
                         if kind!='curve' or k==tag:writer.writerow([row['step'],row['elapsed'],k,v])
             return self.respond(out.getvalue().encode('utf-8-sig'),content_type='text/csv; charset=utf-8',filename=kind+'.csv')
         if kind=='frame':return self.respond((directory/'frame.jpg').read_bytes(),content_type='image/jpeg',filename='frame.jpg')
-        if kind=='model':return self.respond((directory/'model.zip').read_bytes(),content_type='application/zip',filename='model.zip')
+        if kind=='video':
+            name=q.get('name',[''])[0]
+            if not name or Path(name).name!=name or not name.endswith('.mp4'):raise ValueError('无效视频文件名')
+            return self.respond((directory/'videos'/name).read_bytes(),content_type='video/mp4',filename=name)
+        if kind=='model':
+            request=read_json(directory/'request.json',{})
+            if request.get('task') in ('reward_guide','predictor'):
+                checkpoint=directory/'results'/'best_model.pth'
+                return self.respond(checkpoint.read_bytes(),content_type='application/octet-stream',filename='best_model.pth')
+            if request.get('task')=='planner':
+                buffer=io.BytesIO()
+                with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as z:
+                    for rel in ('planner_goal/results/goal_model.pth','planner_dppo/state_final.pt','summary.json'):
+                        checkpoint=directory/rel
+                        if checkpoint.is_file():z.write(checkpoint,rel)
+                return self.respond(buffer.getvalue(),content_type='application/zip',filename='planner_models.zip')
+            return self.respond((directory/'model.zip').read_bytes(),content_type='application/zip',filename='model.zip')
+        if kind=='expert':
+            request=read_json(directory/'request.json',{})
+            if request.get('settings',{}).get('operation')!='expert_collect':raise ValueError('此任务没有 SR-AIRL 专家数据集')
+            return self.respond((directory/'expert_transitions.npz').read_bytes(),content_type='application/octet-stream',filename='expert_transitions.npz')
         if kind not in ('all','tensorboard'):raise ValueError('未知下载类型')
         buffer=io.BytesIO()
         with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as z:

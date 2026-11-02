@@ -214,7 +214,9 @@ class SRAIRLTrainer:
         torch.save(self.discriminator_elcv.state_dict(), directory / "discriminator_elcv.pt")
         torch.save(self.discriminator_rfv.state_dict(), directory / "discriminator_rfv.pt")
         (directory / "config.json").write_text(json.dumps({"algorithm": "SR-AIRL", "srairl": self.config.__dict__,
-            "training": self.train_config.__dict__, "episode": self.episode, "global_steps": self.global_steps}, indent=2))
+            "training": self.train_config.__dict__, "episode": self.episode, "global_steps": self.global_steps,
+            "dynamics_mode":self.envs[0].dynamics_mode,
+            "reactive_background":bool(getattr(getattr(getattr(self.envs[0].world,"engine",None),"traffic_manager",None),"reactive",False))}, indent=2))
 
     @staticmethod
     def load_policies(directory, config, training_config, device="cpu"):
