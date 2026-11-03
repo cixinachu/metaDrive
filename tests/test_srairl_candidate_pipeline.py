@@ -9,7 +9,7 @@ from rl.srairl.pipeline.model_bundle import SRAIRLModelBundle
 from rl.srairl.pipeline.normalization import (
     PlannerGoalNormalizer, RewardPredictorNormalizer, reconstruct_predictor_deltas,
 )
-from rl.srairl.pipeline.schema import JointCandidate, TrajectoryCandidate
+from rl.srairl.pipeline.schema import JointCandidate, PlanningContext, TrajectoryCandidate
 from rl.srairl.pipeline.selector import CandidateSelector
 
 
@@ -71,6 +71,85 @@ def test_coordinate_round_trip_matches_tracker_lateral_sign():
     assert np.allclose(source, recovered, atol=1e-8)
 
 
+def test_planner_inference_loads_metadata_checkpoints_and_uses_target_lane(tmp_path):
+    import sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    from rl.srairl.pipeline.planner_inference import PlannerInference
+    upstream_planner = Path(__file__).resolve().parents[1] / "rl/srairl/upstream/Step2_Planner"
+    if str(upstream_planner) not in sys.path:
+        sys.path.insert(0, str(upstream_planner))
+    from rl.srairl.upstream.Step2_Planner.train_goal import GoalPredictor
+    from rl.srairl.upstream.Step2_Planner.model.temporal import TemporalUnet
+    from rl.srairl.upstream.Step2_Planner.model.diffusion import GaussianDiffusion
+
+    torch.manual_seed(3)
+    goal = GoalPredictor(128)
+    goal_path = tmp_path / "goal.pt"
+    torch.save({"state_dict": goal.state_dict(), "bound_min": [0., -10.],
+                "bound_max": [500., 10.], "architecture": {"context_dim": 128}}, goal_path)
+    model = TemporalUnet(horizon=100, transition_dim=6, dim=64, cond_dim=4,
+                         dim_mults=(1, 2, 4, 8), attention=False)
+    diffusion = GaussianDiffusion(model, horizon=100, observation_dim=4, action_dim=2,
+                                  n_timesteps=20, loss_type="l2", clip_denoised=False,
+                                  predict_epsilon=False, action_weight=10, loss_discount=1)
+    planner_path = tmp_path / "planner.pt"
+    torch.save({"ema": diffusion.state_dict()}, planner_path)
+
+    class Bundle:
+        planner_goal_path = goal_path
+        planner_diffusion_path = planner_path
+
+    inference = PlannerInference(Bundle(), device="cpu")
+    history = {role: np.column_stack((np.full(20, y), np.arange(20),
+                                      np.full(20, 10.), np.zeros(20))).astype(np.float32)
+               for role, y in (("elcv", 0.), ("rfv", 3.5),
+                               ("rlv_current", 0.), ("rlv_target", 3.5))}
+    # Keep the real checkpoint-backed Goal Predictor, while capturing the hard
+    # diffusion conditions so the target-lane terminal is directly asserted.
+    observed = {}
+    def sample(conditions, verbose=False):
+        observed.update({key: value.clone() for key, value in conditions.items()})
+        return SimpleNamespace(trajectories=torch.zeros((1, 100, 6)))
+    inference.diffusion.conditional_sample = sample
+    candidates = inference.generate_candidates(history, PlanningContext(3.5), num_candidates=1, seed=7)
+    assert len(candidates) == 1
+    assert torch.allclose(observed[0][0], torch.tensor([0.0, 19.0, 10.0, 0.0]))
+    assert torch.allclose(observed[99][0, 0], torch.tensor(3.5))
+    assert torch.allclose(observed[99][0, 3], torch.tensor(0.0))
+
+
+def test_predictor_inference_loads_checkpoints_and_reconstructs_physical_state(tmp_path):
+    from types import SimpleNamespace
+    from rl.srairl.pipeline.predictor_inference import RewardGuidedResponsePredictor
+    from rl.srairl.upstream.Step3_Reward_Guide.model.backbone import NoisyReward
+    from rl.srairl.upstream.Step4_Predictor.model.backbone import TransformerConcatLinear
+
+    torch.manual_seed(11)
+    guide = NoisyReward(64, 100)
+    model = TransformerConcatLinear(64, 100)
+    guide_path, predictor_path = tmp_path / "guide.pt", tmp_path / "predictor.pt"
+    checkpoint = {"metadata": {"obs_len": 20, "pred_len": 100},
+                  "architecture": {"context_dim": 64, "T": 100}}
+    torch.save({**checkpoint, "state_dict": guide.state_dict()}, guide_path)
+    torch.save({**checkpoint, "state_dict": model.state_dict()}, predictor_path)
+    inference = RewardGuidedResponsePredictor(SimpleNamespace(
+        reward_guide_path=guide_path, predictor_path=predictor_path), device="cpu")
+    # Exercise the checkpoint-backed inference path with one reverse step to
+    # keep the integration test small while still running both neural models
+    # and reward guidance on the physical RFV trajectory.
+    inference.sampler.T = 1
+    history = np.column_stack((np.zeros(20), np.arange(20) * 1.0,
+                               np.full(20, 10.), np.zeros(20))).astype(np.float32)
+    elcv = trajectory(0., 20.)
+    current = trajectory(0., 40., actions=False)
+    target = trajectory(3.5, 50., actions=False)
+    predicted = inference.predict(history, elcv, current, target)
+    assert predicted.states.shape == (100, 4)
+    assert predicted.actions.shape == (100, 2)
+    assert np.isfinite(predicted.states).all() and np.isfinite(predicted.actions).all()
+
+
 def test_training_normalizers_and_four_dimensional_delta_reconstruction():
     raw = np.array([[25.0, 250.0, 0.0, 40.0]])
     assert np.allclose(PlannerGoalNormalizer.transform(raw), [[0.5, 0.5, 0.5, 1.0]])
@@ -129,11 +208,24 @@ def test_selector_uses_srairl_rewards_and_rejects_uncalibrated_actions():
     first = joint(0, 1.0)
     second = joint(1, 2.0)
     rejected = joint(2, 4.0, np.tile([3.0, 0.0], (100, 1)))
-    selected, diagnostics = selector.select([first, second, rejected])
+    history = {role: np.column_stack((np.full(20, y), np.arange(20),
+                                      np.full(20, 10.), np.zeros(20)))
+               for role, y in (("elcv", 0.), ("rfv", 3.5),
+                               ("rlv_current", 0.), ("rlv_target", 3.5))}
+    selected, diagnostics = selector.select([first, second, rejected], history=history)
     assert selected.candidate_id == 1
     assert rejected.feasibility["feasible"] is False
     assert any("outside_calibration" in reason for reason in rejected.feasibility["reasons"])
     assert len(diagnostics) == 3
+
+
+def test_selector_joins_last_three_observed_frames_to_predicted_frames():
+    actual = np.arange(5 * 16, dtype=np.float32).reshape(5, 16)
+    predicted = (1000 + np.arange(6 * 16, dtype=np.float32)).reshape(6, 16)
+    stacked = CandidateSelector._history_stack(predicted, 4, actual)
+    assert stacked.shape == (6, 64)
+    assert np.array_equal(stacked[0], np.concatenate([actual[-3], actual[-2], actual[-1], predicted[0]]))
+    assert np.array_equal(stacked[1], np.concatenate([actual[-2], actual[-1], predicted[0], predicted[1]]))
 
 
 def test_history_buffer_pads_initial_frame_and_requires_four_roles():
@@ -190,8 +282,9 @@ def test_one_closed_loop_episode_executes_dual_tracker_and_replans():
                         "minimum_distance_m": 8.0, "route_completion": self.steps / 3}
 
     class Planner:
-        def generate_candidates(self, history, num_candidates, seed):
+        def generate_candidates(self, history, planning_context, num_candidates, seed):
             assert all(value.shape == (20, 4) for value in history.values())
+            assert planning_context.target_lateral_position == 0.0
             return [trajectory(0.0, 0.0)]
 
     class Predictor:
@@ -209,6 +302,7 @@ def test_one_closed_loop_episode_executes_dual_tracker_and_replans():
         tracker=SRAIRLTrajectoryTracker(action_adapter=None), role_forecaster=Forecaster(),
         candidate_count=1, replan_steps=2,
         lane_state_mapper=lambda role, state, env: np.array([state[1], -state[0], state[2], state[3]]),
+        planning_context_provider=lambda env, history: PlanningContext(0.0),
     )
     result = pipeline.evaluate_episode(env, seed=9)
     assert result["metrics"].planning_steps == 2

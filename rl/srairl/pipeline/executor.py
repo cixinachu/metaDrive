@@ -7,7 +7,7 @@ import numpy as np
 from env.tasks.srairl_trajectory_tracker import trajectory_tracking_metrics
 from .candidate_builder import build_joint_candidates
 from .evaluator import EpisodeMetrics
-from .schema import CandidateBundle
+from .schema import CandidateBundle, PlanningContext
 
 
 class RoleHistoryBuffer:
@@ -50,7 +50,8 @@ class SRAIRLClosedLoopPipeline:
     """
     def __init__(self, *, planner, predictor, selector, tracker,
                  role_forecaster, candidate_count=16, replan_steps=5,
-                 model_bundle=None, calibration_hash="", lane_state_mapper=None):
+                 model_bundle=None, calibration_hash="", lane_state_mapper=None,
+                 planning_context_provider=None):
         if candidate_count < 1 or replan_steps < 1:
             raise ValueError("candidate_count and replan_steps must be positive")
         self.planner = planner
@@ -63,6 +64,7 @@ class SRAIRLClosedLoopPipeline:
         self.model_bundle = model_bundle
         self.calibration_hash = str(calibration_hash)
         self.lane_state_mapper = lane_state_mapper
+        self.planning_context_provider = planning_context_provider
 
     @staticmethod
     def _environment_roles(env):
@@ -119,10 +121,15 @@ class SRAIRLClosedLoopPipeline:
         last_info = {}
         while not done:
             state_history = history.current()
+            if self.planning_context_provider is None:
+                raise RuntimeError("a task target-lane planning context provider is required")
+            planning_context = self.planning_context_provider(env, state_history)
+            if not isinstance(planning_context, PlanningContext):
+                raise TypeError("planning_context_provider must return PlanningContext")
             decision_started = time.perf_counter()
             started = time.perf_counter()
             proposals = self.planner.generate_candidates(
-                state_history, num_candidates=self.candidate_count,
+                state_history, planning_context, num_candidates=self.candidate_count,
                 seed=int(seed) + decisions,
             )
             metrics.planning_latency_s.append(time.perf_counter() - started)
@@ -133,7 +140,7 @@ class SRAIRLClosedLoopPipeline:
                 rlv_current, rlv_target, dt=0.1,
             )
             metrics.predictor_latency_s.append(time.perf_counter() - started)
-            selected, returns = self.selector.select(joint)
+            selected, returns = self.selector.select(joint, history=state_history)
             metrics.candidate_returns.append({"planning_step": decisions,
                                               "candidate_returns": returns,
                                               "selected_candidate_id": selected.candidate_id})

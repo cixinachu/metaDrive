@@ -27,8 +27,15 @@ class CandidateSelector:
         return np.concatenate([e, e-r, c-e, t-e], axis=-1)
 
     @staticmethod
-    def _history_stack(states, history_len):
-        window = [states[0]] * (history_len - 1)
+    def _history_stack(states, history_len, history_states=None):
+        if history_states is None:
+            raise ValueError("candidate reward scoring requires observed four-vehicle history")
+        history_states = np.asarray(history_states, dtype=np.float32)
+        if history_states.ndim != 2 or history_states.shape[1] != 16 or len(history_states) < history_len - 1:
+            raise ValueError(f"history states must contain at least {history_len - 1} finite 16D frames")
+        if not np.isfinite(history_states).all():
+            raise ValueError("history states must be finite")
+        window = list(history_states[-(history_len - 1):]) if history_len > 1 else []
         result = []
         for state in states:
             window.append(state)
@@ -61,10 +68,10 @@ class CandidateSelector:
         return reasons
 
     @staticmethod
-    def _reward(discriminator, state):
+    def _reward(discriminator, state, history_states=None):
         device = next(discriminator.parameters()).device
         history_len = int(getattr(discriminator, "history_len", 4))
-        stacked = CandidateSelector._history_stack(state, history_len)
+        stacked = CandidateSelector._history_stack(state, history_len, history_states)
         with torch.no_grad():
             tensor = torch.as_tensor(stacked, dtype=torch.float32, device=device)
             if hasattr(discriminator, "get_reward"):
@@ -75,7 +82,26 @@ class CandidateSelector:
                 raise TypeError("SR-AIRL discriminator must expose get_reward or calculate_reward")
         return reward.reshape(-1).detach().cpu().numpy()
 
-    def select(self, candidates):
+    @staticmethod
+    def _observed_history_frames(history):
+        if history is None:
+            raise ValueError("candidate selection requires the observed four-vehicle history")
+        required = {"elcv", "rfv", "rlv_current", "rlv_target"}
+        if set(history) != required:
+            raise ValueError(f"observed history roles must be exactly {sorted(required)}")
+        arrays = {role: np.asarray(history[role], dtype=np.float32) for role in required}
+        lengths = {len(value) for value in arrays.values()}
+        if len(lengths) != 1 or any(value.ndim != 2 or value.shape[1] != 4 or not np.isfinite(value).all()
+                                    for value in arrays.values()):
+            raise ValueError("observed role histories must be aligned finite [N,4] [y,x,vx,vy]")
+        e = RewardPredictorNormalizer.transform(arrays["elcv"])
+        r = RewardPredictorNormalizer.transform(arrays["rfv"])
+        c = RewardPredictorNormalizer.transform(arrays["rlv_current"])
+        t = RewardPredictorNormalizer.transform(arrays["rlv_target"])
+        return np.concatenate([e, e-r, c-e, t-e], axis=-1)
+
+    def select(self, candidates, history=None):
+        observed_frames = self._observed_history_frames(history)
         feasible = []
         diagnostics = []
         for candidate in candidates:
@@ -85,8 +111,8 @@ class CandidateSelector:
                 diagnostics.append({"candidate_id": candidate.candidate_id, "rejected": reasons})
                 continue
             state = self._state(candidate)
-            re = self._reward(self.elcv_discriminator, state)
-            rr = self._reward(self.rfv_discriminator, state)
+            re = self._reward(self.elcv_discriminator, state, observed_frames)
+            rr = self._reward(self.rfv_discriminator, state, observed_frames)
             weights = self.gamma ** np.arange(len(state))
             candidate.reward_elcv = float(weights @ re)
             candidate.reward_rfv = float(weights @ rr)

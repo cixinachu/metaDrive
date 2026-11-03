@@ -15,6 +15,17 @@ def _finite_array(value, shape, name):
 
 
 @dataclass(frozen=True)
+class PlanningContext:
+    """Terminal lane target in the same lateral frame as Planner history."""
+    target_lateral_position: float
+    target_lateral_velocity: float = 0.0
+
+    def __post_init__(self):
+        if not np.isfinite(self.target_lateral_position) or not np.isfinite(self.target_lateral_velocity):
+            raise ValueError("planning context lateral target must be finite")
+
+
+@dataclass(frozen=True)
 class TrajectoryCandidate:
     """Upstream physical state [y, x, vx, vy], actions [ax, ay]."""
     states: np.ndarray

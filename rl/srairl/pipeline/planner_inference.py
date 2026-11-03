@@ -5,7 +5,7 @@ import numpy as np
 import torch
 
 from .normalization import PlannerGoalNormalizer
-from .schema import TrajectoryCandidate
+from .schema import PlanningContext, TrajectoryCandidate
 
 
 class PlannerInference:
@@ -20,7 +20,7 @@ class PlannerInference:
         from rl.srairl.upstream.Step2_Planner.model.temporal import TemporalUnet
         from rl.srairl.upstream.Step2_Planner.model.diffusion import GaussianDiffusion
 
-        goal_data = torch.load(bundle.planner_goal_path, map_location=self.device, weights_only=False)
+        goal_data = torch.load(self.bundle.planner_goal_path, map_location=self.device, weights_only=True)
         if not isinstance(goal_data, dict) or "state_dict" not in goal_data:
             raise ValueError("Goal Predictor checkpoint is legacy full-module format; retrain with the current checkpoint contract")
         architecture = goal_data.get("architecture", {})
@@ -37,7 +37,7 @@ class PlannerInference:
             loss_type="l2", clip_denoised=False, predict_epsilon=False,
             action_weight=10, loss_discount=1,
         ).to(self.device)
-        checkpoint = torch.load(bundle.planner_diffusion_path, map_location=self.device, weights_only=True)
+        checkpoint = torch.load(self.bundle.planner_diffusion_path, map_location=self.device, weights_only=True)
         state = checkpoint.get("ema", checkpoint.get("model", checkpoint))
         self.diffusion.load_state_dict(state, strict=True)
         self.diffusion.eval()
@@ -74,17 +74,23 @@ class PlannerInference:
         return normalized_delta * (self.goal_max - self.goal_min) + self.goal_min
 
     @torch.no_grad()
-    def generate_candidates(self, history, num_candidates=16, seed=0):
+    def generate_candidates(self, history, planning_context, num_candidates=16, seed=0):
         if num_candidates < 1:
             raise ValueError("num_candidates must be positive")
+        if not isinstance(planning_context, PlanningContext):
+            raise TypeError("planning_context must be a PlanningContext with the task target lane")
         history = self._validate_history(history)
         goal = self.predict_goal(history)
         centered_current = history["elcv"][-1].copy()
         centered_current[:2] -= self._origin
         current = torch.as_tensor(centered_current, device=self.device)
         terminal = current.clone()
+        # Goal Predictor is trained only for longitudinal displacement and
+        # speed change. The lane-change task supplies the lateral terminal.
+        terminal[0] = float(planning_context.target_lateral_position) - float(self._origin[0])
         terminal[1] += goal[0]
         terminal[2] += goal[1]
+        terminal[3] = float(planning_context.target_lateral_velocity)
         conditions = {
             0: current[None, :].repeat(num_candidates, 1),
             99: terminal[None, :].repeat(num_candidates, 1),

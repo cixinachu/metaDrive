@@ -13,6 +13,7 @@ from rl.srairl.pipeline.model_bundle import SRAIRLModelBundle, sha256
 from rl.srairl.pipeline.planner_inference import PlannerInference
 from rl.srairl.pipeline.predictor_inference import RewardGuidedResponsePredictor
 from rl.srairl.pipeline.role_forecasting import forecast_rlv_roles
+from rl.srairl.pipeline.schema import PlanningContext
 from rl.srairl.pipeline.selector import CandidateSelector
 from rl.srairl.upstream.adapter import load_reward_discriminator
 
@@ -98,11 +99,36 @@ class InteractionEvaluationTask:
             y, x, vx, vy = np.asarray(state, dtype=float)
             return np.asarray([x, -y, vx, vy])
 
+        def planning_context(current_env, history):
+            ego = current_env.world.role_vehicle("elcv")
+            if getattr(current_env, "scenario_type", None) == "merge":
+                paths = getattr(current_env.world, "_interaction_paths", {})
+                target_path = paths.get("rlv_target", (None, 0., 0.))[0]
+                if not target_path:
+                    raise RuntimeError("merge target-lane geometry is unavailable")
+                speed = max(1.0, float(np.linalg.norm(ego.velocity[:2])))
+                desired_x = float(ego.position[0]) + speed * 10.0
+                points = []
+                for lane in target_path:
+                    samples = np.linspace(0.0, float(lane.length), max(2, int(lane.length / 2.0) + 1))
+                    points.extend(np.asarray(lane.position(float(s), 0.0), dtype=float)[:2]
+                                  for s in samples)
+                target_point = min(points, key=lambda point: abs(float(point[0]) - desired_x))
+                target_y = float(target_point[1])
+            else:
+                source = current_env._source_lane
+                target = current_env._target_lane
+                source_s, _ = source.local_coordinates(ego.position[:2])
+                target_center = target.position(float(source_s), 0.0)
+                _, target_y = source.local_coordinates(np.asarray(target_center, dtype=float)[:2])
+            return PlanningContext(target_lateral_position=float(target_y), target_lateral_velocity=0.0)
+
         pipeline = SRAIRLClosedLoopPipeline(
             planner=planner, predictor=predictor, selector=selector, tracker=tracker,
             role_forecaster=forecast_rlv_roles, candidate_count=self.candidate_count,
             replan_steps=self.replan_steps, model_bundle=self.model_bundle,
             calibration_hash=self.calibration_hash, lane_state_mapper=map_to_tracker,
+            planning_context_provider=planning_context,
         )
         pipeline.selector.lane_check = lane_check
         video = None
