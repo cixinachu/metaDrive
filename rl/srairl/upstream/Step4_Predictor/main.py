@@ -22,6 +22,7 @@ from torch.utils.tensorboard import SummaryWriter  # TensorBoard 记录
 import os
 from datetime import datetime
 import warnings
+import hashlib
 warnings.filterwarnings('ignore')
 
 
@@ -80,6 +81,7 @@ def eval(args, loader, sampler, model, guide, writer=None, epoch=None):
         state_data = batch[3].to(device)
 
         hist_init = copy.deepcopy(hist_traj[:, 0:1, :2])
+        guidance_history_last = hist_traj[:, -1, :4].clone()
         with torch.no_grad():
             pre_pred_traj = torch.cat([hist_traj[:, -1:, :], pred_traj[:, :-1, :]], dim=1)
             diff_pred_traj = pred_traj - pre_pred_traj
@@ -88,8 +90,17 @@ def eval(args, loader, sampler, model, guide, writer=None, epoch=None):
             context = model.context(hist_traj, cond_traj)
 
             # Sampling
+            n_lcv = state_data[:, :, :4]
+            guidance_state = {
+                # Positions are shifted in-place in hist_traj for context
+                # encoding; guidance reconstructs absolute positions.
+                'rfv_history_last': guidance_history_last,
+                'n_lcv': n_lcv,
+                'n_nlv': n_lcv + state_data[:, :, 8:12],
+                'n_olv': n_lcv + state_data[:, :, 12:16],
+            }
             pred_diff, _ = sampler(node_loc=diff_pred_traj,
-                                   context=context, state=state_data, guide=guide)
+                                   context=context, state=guidance_state, guide=guide)
             hist_traj[:, :, :2] += hist_init
             preds = torch.cat([hist_traj[:, -1:, :2], pred_diff[:, :, :2]], dim=1)
             preds = torch.cumsum(preds, dim=1)[:, 1:, :]
@@ -133,7 +144,21 @@ def train(args):
     guide_path = Path(args.reward_guide_path).resolve()
     if not guide_path.is_file():
         raise FileNotFoundError(f"Reward Guide checkpoint not found: {guide_path}")
-    guide = torch.load(guide_path, map_location=device, weights_only=False).to(device)
+    guide_checkpoint = torch.load(guide_path, map_location=device, weights_only=False)
+    if isinstance(guide_checkpoint, dict) and 'state_dict' in guide_checkpoint:
+        architecture = guide_checkpoint.get('architecture', {})
+        if architecture.get('context_dim', args.context_dim) != args.context_dim or \
+                architecture.get('T', args.T) != args.T:
+            raise ValueError('reward-guide checkpoint architecture does not match Predictor settings')
+        guide = NoisyReward(args.context_dim, args.T).to(device)
+        guide.load_state_dict(guide_checkpoint['state_dict'], strict=True)
+    elif isinstance(guide_checkpoint, torch.nn.Module):
+        # Compatibility with upstream full-module checkpoints created before
+        # the local state-dict checkpoint contract was introduced.
+        guide = guide_checkpoint.to(device)
+    else:
+        raise ValueError('unsupported Reward Guide checkpoint format')
+    guide.eval()
 
     # show model size
     model_size = 0
@@ -212,7 +237,14 @@ def train(args):
                 best_ade = val_ade
                 best_epoch = epoch
                 print('Best model updated, testing ...')
-                torch.save(ema_model, results_dir / 'best_model.pth')
+                torch.save({
+                    'state_dict': ema_model.state_dict(),
+                    'architecture': {'context_dim': args.context_dim, 'T': args.T},
+                    'metadata': {'obs_len': args.obs_len, 'pred_len': args.pred_len,
+                                 'dt': 0.1, 'state_dim': 16, 'history_len': 4,
+                                 'normalization_version': 'reward-predictor-v1',
+                                 'dataset_revision': hashlib.sha256(Path(args.data_path).read_bytes()).hexdigest()},
+                }, results_dir / 'best_model.pth')
 
         values = {'train/loss': float(np.mean(epoch_loss))}
         if epoch % args.sample_step == 0:

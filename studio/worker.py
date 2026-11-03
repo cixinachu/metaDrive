@@ -925,6 +925,76 @@ def main():
     torch.set_num_threads(1)
     atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
     try:
+        if job.get('task')=='evaluation':
+            from env.tasks.srairl_interaction import SRAIRLInteractionScenario
+            from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+            from rl.srairl.config import SRAIRLConfig
+            from rl.srairl.pipeline.model_bundle import SRAIRLModelBundle
+            from tasks.interaction_evaluation_task import InteractionEvaluationTask
+            c=job['settings'];paths=c['model_bundle_paths']
+            bundle=SRAIRLModelBundle.from_checkpoints(
+                planner_goal_path=paths['planner_goal_path'],
+                planner_diffusion_path=paths['planner_diffusion_path'],
+                reward_guide_path=paths['reward_guide_path'],
+                predictor_path=paths['predictor_path'],
+                reward_model_path=paths['reward_model_path'])
+            atomic_json(directory/'model_bundle.json',bundle.to_manifest())
+            task=InteractionEvaluationTask(
+                model_bundle=bundle,
+                calibration_summary=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',
+                device=('cuda' if c.get('srairl_device')=='auto' and torch.cuda.is_available() else
+                        'cpu' if c.get('srairl_device')=='auto' else c.get('srairl_device')),
+                candidate_count=c['candidate_count'],
+                replan_steps=c['replan_steps'])
+            config=SRAIRLConfig.from_mapping()
+            all_metrics=[]
+            evaluation_started=time.monotonic()
+            for episode in range(c['episodes']):
+                env=SRAIRLProceduralEnv(
+                    scenario_type=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
+                    seed=c['scene_seed']+episode,horizon=c['horizon'],view_mode=c['srairl_view'],
+                    config=config,traffic_seed=c['traffic_seed']+episode,
+                    interaction_scenario=SRAIRLInteractionScenario(**c['interaction_scenario']),
+                    rfv_response='policy',initial_state_samples=load_srairl_initial_state_samples(c))
+                try:
+                    output=directory/f'episode_{episode+1:04d}.json'
+                    result=task.evaluate(env,seed=c['scene_seed']+episode,output_path=output,
+                                         scenario_id=f"{c['scenario']}-{episode:04d}",episode_index=episode+1)
+                    row=result['metrics'].to_dict();all_metrics.append(row)
+                    with (directory/'episodes.jsonl').open('a',encoding='utf-8') as stream:
+                        stream.write(json.dumps(row,allow_nan=False)+'\n')
+                    values={
+                        'evaluation/lane_change_success_rate':float(row['lane_change_success']),
+                        'evaluation/collision_rate':float(row['collision']),
+                        'evaluation/out_of_road_rate':float(row['out_of_road']),
+                        'evaluation/route_completion':float(row['route_completion']),
+                        'evaluation/candidate_count':float(row['candidate_count']),
+                        'evaluation/selected_srairl_return':float(np.mean(row['selected_srairl_returns'])) if row['selected_srairl_returns'] else 0.,
+                        'evaluation/planning_latency_s':float(np.mean(row['planning_latency_s'])) if row['planning_latency_s'] else 0.,
+                        'evaluation/predictor_latency_s':float(np.mean(row['predictor_latency_s'])) if row['predictor_latency_s'] else 0.,
+                    }
+                    for key in ('minimum_ttc_s','minimum_distance_m','time_to_lane_change_s'):
+                        if row.get(key) is not None:values['evaluation/'+key]=float(row[key])
+                    for key,source in (('evaluation/delta_v_rfv_mps','rfv_delta_v_mps'),
+                                       ('evaluation/target_gap_change_m','target_gap_change_m')):
+                        values[key]=float(row[source])
+                    with (directory/'metrics.jsonl').open('a',encoding='utf-8') as stream:
+                        stream.write(json.dumps({'step':episode+1,'elapsed':time.monotonic()-evaluation_started,
+                                                 'values':values},allow_nan=False)+'\n')
+                    atomic_json(directory/'status.json',dict(state='running',kind='eval',step=episode+1,
+                        total=c['episodes'],episodes=episode+1,device=str(task.device),phase='closed_loop'))
+                finally:
+                    env.close()
+            summary={'task':'evaluation','protocol':'closed_loop_metadrive_receding_horizon',
+                'scenario':c['scenario'],'initialization_protocol':c['initialization_protocol'],
+                'episodes':len(all_metrics),'candidate_count':c['candidate_count'],
+                'replan_steps':c['replan_steps'],'seed':c['seed'],'model_bundle_id':c['model_bundle_id'],
+                'metrics':all_metrics,'calibration_hash':task.calibration_hash,
+                'test_note':'Each generated seed is evaluated once; scenes are not independent if they share a source recording.'}
+            atomic_json(directory/'summary.json',summary)
+            atomic_json(directory/'status.json',dict(state='completed',kind='eval',step=c['episodes'],
+                total=c['episodes'],episodes=c['episodes'],device=str(task.device),protocol=summary['protocol']))
+            return
         if job.get('task') in ('planner','reward_guide','predictor'):
             result=(train_upstream_planner(directory,c) if job['task']=='planner' else
                     train_reward_guide(directory,c) if job['task']=='reward_guide' else

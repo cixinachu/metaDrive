@@ -126,6 +126,7 @@ def main():
         'controls':CONTROLS.tolist(),'dt_s':DT,'measurement_window_steps':WINDOW,
         'vehicle_model':'MetaDrive default vehicle','max_speed_km_h':130,'natural_coast_included':True,
         'acceptance':{'mae_mps2_lt':args.mae_limit,'max_error_mps2_lt':args.max_error_limit,'sign_correct_for_abs_desired_ge_mps2':.5},
+        'validated_acceleration_domain':{'ax_mps2':[-1.5,1.5], 'ay_mps2':[-1.5,1.5]},
         'metrics':metrics,'equivalence_status':'passed' if passed else 'failed',
         'physics_evaluation_allowed':bool(passed),'calibration_file':'calibration.npz'}
     (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')

@@ -329,6 +329,46 @@ def clean_planner_request(raw, kind):
             'batch_size':batch_size,'seed':seed,'device':device}
 
 
+def clean_interaction_evaluation_request(raw):
+    """Validate the integrated Planner → Predictor → SR-AIRL evaluation task."""
+    scenario = raw.get('pipeline_scenario', 'straight')
+    initialization = raw.get('pipeline_initialization', 'canonical')
+    lane_num = raw.get('srairl_lane_num', 3)
+    density = raw.get('srairl_traffic_density', .15)
+    horizon = raw.get('srairl_horizon', 500)
+    seed = raw.get('pipeline_seed', 0)
+    episodes = raw.get('pipeline_episodes', 1)
+    candidates = raw.get('pipeline_candidates', 16)
+    replan_steps = raw.get('pipeline_replan_steps', 5)
+    if scenario not in ('straight', 'curve', 'merge'):
+        raise ValueError('综合评估场景只能是直道、弯道或匝道汇入')
+    if initialization not in ('canonical', 'ngsim_distribution'):
+        raise ValueError('初始状态只能使用典型状态或 NGSIM 分布')
+    if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
+        raise ValueError('pipeline_seed must be an integer in [0, 2^32)')
+    if isinstance(episodes, bool) or not isinstance(episodes, int) or not 1 <= episodes <= 1000:
+        raise ValueError('综合评估回合数必须在 [1,1000]')
+    if isinstance(candidates, bool) or not isinstance(candidates, int) or not 1 <= candidates <= 64:
+        raise ValueError('Planner 候选数必须在 [1,64]')
+    if isinstance(replan_steps, bool) or not isinstance(replan_steps, int) or not 1 <= replan_steps <= 20:
+        raise ValueError('重规划步数必须在 [1,20]')
+    if initialization == 'ngsim_distribution' and scenario == 'merge':
+        raise ValueError('当前 NGSIM 初始分布只用于直道或弯道 MetaDrive 场景')
+    raw_srairl = dict(raw)
+    raw_srairl.update(srairl_operation='interaction', srairl_scene_source='procedural',
+        srairl_dynamics_mode='metadrive_physics', srairl_initialization=initialization,
+        srairl_scenario=scenario, srairl_model_id='pipeline-bundle',
+        srairl_seed=seed, srairl_episodes=episodes, srairl_lane_num=lane_num,
+        srairl_traffic_density=density, srairl_horizon=horizon,
+        srairl_device=raw.get('srairl_device', 'auto'))
+    base = clean_srairl_request(raw_srairl, 'eval')
+    base.update(task='evaluation', operation='closed_loop', pipeline_scenario=scenario,
+        initialization_protocol=initialization, seed=seed, episodes=episodes,
+        candidate_count=candidates, replan_steps=replan_steps,
+        view_mode=raw.get('srairl_view', 'topdown'))
+    return base
+
+
 def environment_config(c, kind):
     split = 'train' if kind == 'train' or (kind == 'preview' and 1000 <= c['seed_start'] < 2000) else 'eval'
     cfg = load_config(ROOT/f'configs/env/{"train" if split=="train" else "eval_id"}.yaml')

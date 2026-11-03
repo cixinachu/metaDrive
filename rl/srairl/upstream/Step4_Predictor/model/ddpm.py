@@ -111,7 +111,8 @@ class GaussianDiffusionSampler(nn.Module):
         xt_prev_mean = self.predict_xt_prev_mean_from_eps(x_t, t, eps=eps)
 
         if guide:
-            gradient = self.guide_fn(xt_prev_mean, t, guide, state)
+            gradient = self.guide_fn(xt_prev_mean, t, guide, state,
+                                     guide_scale=getattr(self, 'guide_scale', 10.0))
             new_mean = (
                     xt_prev_mean.float() + torch.exp(model_log_var) * gradient.float()
             )
@@ -122,23 +123,32 @@ class GaussianDiffusionSampler(nn.Module):
             return xt_prev_mean, model_log_var
 
     def guide_fn(self, all_x, t, guide, state, guide_scale=10.0):
+        """Differentiate SR-AIRL reward through the RFV delta trajectory.
+
+        Runtime state is a mapping containing physical RFV history and normalized
+        ELCV/neighbor futures. The former implementation normalized ``all_x`` as
+        if deltas were absolute positions and collapsed the entire gradient to a
+        scalar; both prevented meaningful response guidance.
+        """
+        if not isinstance(state, dict):
+            raise TypeError("reward-guided predictor requires structured physical runtime state")
         with torch.enable_grad():
-            guide.train()
-            n_fv = state[:, :, :4] - state[:, :, 4:8]
-            n_nlv = state[:, :, :4] + state[:, :, 8:12]
-            n_olv = state[:, :, :4] + state[:, :, 12:]
-            new_n_lcv = normalize_obs(all_x.detach().cpu().numpy())
-            new_n_lcv = torch.from_numpy(new_n_lcv).to(all_x.device).float()
-            dfv = new_n_lcv - n_fv
-            dnlv = n_nlv - new_n_lcv
-            dolv = n_olv - new_n_lcv
-
-            state = torch.concatenate([new_n_lcv, dfv, dnlv, dolv], dim=-1).requires_grad_(True)
-
-            pred_reward_loss = torch.abs(guide(state, t) - 0.5)
-            grad = torch.autograd.grad(outputs=pred_reward_loss.sum(), inputs=state)[0].mean() * guide_scale
-
-            return grad
+            deltas = all_x.detach().requires_grad_(True)
+            hist_last = state['rfv_history_last'].to(all_x.device)
+            physical = hist_last[:, None, :] + torch.cumsum(deltas, dim=1)
+            y = torch.clamp(physical[..., 0] / 25.0, -1.0, 1.0)
+            x = torch.clamp(physical[..., 1] / 500.0, -1.0, 1.0)
+            velocity = torch.clamp((physical[..., 2:4] + 40.0) / 80.0, -1.0, 1.0)
+            n_fv = torch.cat([y.unsqueeze(-1), x.unsqueeze(-1), velocity], dim=-1)
+            n_lcv = state['n_lcv'].to(all_x.device)
+            n_nlv = state['n_nlv'].to(all_x.device)
+            n_olv = state['n_olv'].to(all_x.device)
+            guide_state = torch.cat([n_lcv, n_lcv - n_fv, n_nlv - n_lcv,
+                                     n_olv - n_lcv], dim=-1)
+            reward = guide(guide_state, t)
+            # Classifier guidance ascends the learned SR-AIRL reward.
+            grad = torch.autograd.grad(reward.sum(), deltas, retain_graph=False)[0]
+            return grad * float(guide_scale)
 
     def forward(self, node_loc, context, state=None, guide=None):
         """

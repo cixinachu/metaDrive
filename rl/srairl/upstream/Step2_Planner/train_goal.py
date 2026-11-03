@@ -10,6 +10,7 @@ warnings.filterwarnings('ignore')
 import argparse
 import json
 import time
+import hashlib
 
 import pickle
 import sys
@@ -243,7 +244,15 @@ def main(args):
             best_rmse = test_x
             best_v_rmse = test_v
             model_path = results_dir / "goal_model.pth"
-            torch.save(model, model_path)
+            torch.save({
+                'state_dict': model.state_dict(),
+                'bound_min': bound_min.detach().cpu(),
+                'bound_max': bound_max.detach().cpu(),
+                'architecture': {'context_dim': 128, 'input_size': 2},
+                'metadata': {'obs_len': 20, 'horizon': 100, 'dt': 0.1,
+                             'pred_len': 100, 'normalization_version': 'planner-goal-v1',
+                             'dataset_revision': hashlib.sha256(Path(args.data_path).read_bytes()).hexdigest()},
+            }, model_path)
             print(f'Best model saved to {model_path} (x_rmse={test_x:.4f})')
         if args.studio_dir:
             studio_dir=Path(args.studio_dir)

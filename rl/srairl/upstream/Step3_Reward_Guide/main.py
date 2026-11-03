@@ -20,6 +20,7 @@ from torch.utils.tensorboard import SummaryWriter  # TensorBoard 记录
 import os
 from datetime import datetime
 import warnings
+import hashlib
 warnings.filterwarnings('ignore')
 
 
@@ -235,7 +236,14 @@ def train(args):
                 # 保存到当前日志目录的 results 子目录
                 # This source had never updated ema_model, so saving it yielded
                 # random initialization. The trained model is the valid best.
-                torch.save(model, results_dir / 'best_model.pth')
+                torch.save({
+                    'state_dict': model.state_dict(),
+                    'architecture': {'context_dim': args.context_dim, 'T': args.T},
+                    'metadata': {'obs_len': args.obs_len, 'pred_len': args.pred_len,
+                                 'dt': 0.1, 'state_dim': 16, 'history_len': 4,
+                                 'normalization_version': 'reward-predictor-v1',
+                                 'dataset_revision': hashlib.sha256(Path(args.data_path).read_bytes()).hexdigest()},
+                }, results_dir / 'best_model.pth')
 
         values = {'train/loss': float(np.mean(epoch_loss))}
         if epoch % args.sample_step == 0:

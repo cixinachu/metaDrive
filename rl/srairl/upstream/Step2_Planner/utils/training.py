@@ -64,6 +64,7 @@ class Trainer(object):
         dppo_gamma=0.99,
         dppo_every=10,
         progress_callback=None,
+        checkpoint_metadata=None,
     ):
         super().__init__()
         self.model = diffusion_model
@@ -101,6 +102,7 @@ class Trainer(object):
         self.dppo_gamma = float(dppo_gamma)
         self.dppo_every = int(dppo_every)
         self.progress_callback = progress_callback
+        self.checkpoint_metadata = dict(checkpoint_metadata or {})
 
         self.reset_parameters()
         self.step = 0
@@ -365,7 +367,8 @@ class Trainer(object):
         data = {
             'step': self.step,
             'model': self.model.state_dict(),
-            'ema': self.ema_model.state_dict()
+            'ema': self.ema_model.state_dict(),
+            'metadata': self.checkpoint_metadata,
         }
         savepath = os.path.join(self.logdir, f'state_{epoch}.pt')
         torch.save(data, savepath)

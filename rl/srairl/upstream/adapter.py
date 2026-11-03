@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 
-def load_reward_discriminator(model_dir, device="cpu"):
+def load_reward_discriminator(model_dir, device="cpu", role="fv"):
     """Rebuild the local FV discriminator from its state-dict checkpoint.
 
     Upstream Step 3 expected a pickled module from its own Step 1. Studio saves
@@ -14,11 +14,12 @@ def load_reward_discriminator(model_dir, device="cpu"):
     """
     directory = Path(model_dir).resolve()
     metadata_path = directory / "config.json"
-    checkpoint_path = directory / "discriminator_rfv.pt"
+    role_key = {"fv": "discriminator_rfv.pt", "lcv": "discriminator_elcv.pt"}.get(role)
+    if role_key is None:
+        raise ValueError("role must be 'lcv' or 'fv'")
+    checkpoint_path = directory / role_key
     if not metadata_path.is_file() or not checkpoint_path.is_file():
-        raise FileNotFoundError(
-            f"SR-AIRL model must contain config.json and discriminator_rfv.pt: {directory}"
-        )
+        raise FileNotFoundError(f"SR-AIRL model must contain config.json and {role_key}: {directory}")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     if metadata.get("algorithm") != "SR-AIRL" or "srairl" not in metadata:
         raise ValueError(f"Not a compatible local SR-AIRL model: {directory}")
@@ -42,7 +43,7 @@ def load_reward_discriminator(model_dir, device="cpu"):
         cfg.gamma,
         potential,
         cfg.alpha_init,
-        role="fv",
+        role=role,
         history_len=cfg.history_len,
     )
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)

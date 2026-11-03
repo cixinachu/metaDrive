@@ -15,7 +15,7 @@ import time
 import zipfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,clean_srairl_request,clean_reward_guide_request,clean_predictor_request,clean_planner_request,atomic_json
+from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,clean_srairl_request,clean_reward_guide_request,clean_predictor_request,clean_planner_request,clean_interaction_evaluation_request,atomic_json
 from tasks.registry import TASK_REGISTRY
 
 from rl.algorithms import metadata as algorithm_metadata
@@ -88,6 +88,64 @@ def reward_guide_model_catalog():
     return result
 
 
+def srairl_pipeline_bundle_catalog():
+    """List only complete, metadata-compatible component bundles."""
+    import torch
+    def payload(path):
+        try:
+            value=torch.load(path,map_location='cpu',weights_only=True)
+            return value if isinstance(value,dict) else {}
+        except Exception:
+            return {}
+    planners=[];guides=[];predictors=[]
+    for summary_path in (ROOT/'models').glob('*/summary.json'):
+        summary=read_json(summary_path,{}) or {};base=summary_path.parent
+        task=summary.get('task')
+        if task=='planner':
+            goal=base/'planner_goal/results/goal_model.pth';planner=base/'planner_dppo/state_final.pt'
+            if goal.is_file() and planner.is_file():
+                goal_data=payload(goal);planner_data=payload(planner)
+                planners.append((base,goal,planner,goal_data.get('metadata',{}),planner_data.get('metadata',{})))
+        elif task=='reward_guide':
+            checkpoint=base/'results/best_model.pth'
+            if checkpoint.is_file():guides.append((base,checkpoint,payload(checkpoint).get('metadata',{})))
+        elif task=='predictor':
+            checkpoint=base/'results/best_model.pth'
+            if checkpoint.is_file():predictors.append((base,checkpoint,payload(checkpoint).get('metadata',{})))
+    rewards=[]
+    for config_path in (ROOT/'models').glob('*/config.json'):
+        config=read_json(config_path,{}) or {};base=config_path.parent
+        if config.get('algorithm')=='SR-AIRL' and (base/'discriminator_elcv.pt').is_file() and (base/'discriminator_rfv.pt').is_file():
+            rewards.append((base,config))
+    result=[]
+    for _,goal,planner,goal_meta,planner_meta in planners:
+        revision=goal_meta.get('dataset_revision')
+        if not revision or planner_meta.get('dataset_revision')!=revision:continue
+        for _,guide,guide_meta in guides:
+            if guide_meta.get('dataset_revision')!=revision:continue
+            for _,predictor,predictor_meta in predictors:
+                if predictor_meta.get('dataset_revision')!=revision:continue
+                for reward_dir,_ in rewards:
+                    try:
+                        from rl.srairl.pipeline.model_bundle import SRAIRLModelBundle
+                        bundle=SRAIRLModelBundle.from_checkpoints(
+                            planner_goal_path=goal,planner_diffusion_path=planner,
+                            reward_guide_path=guide,predictor_path=predictor,
+                            reward_model_path=reward_dir)
+                        manifest=bundle.to_manifest()
+                    except Exception:
+                        continue
+                    identifier=hashlib.sha256(json.dumps(manifest['checkpoints'],sort_keys=True).encode()).hexdigest()[:20]
+                    result.append({'id':identifier,'label':f'SR-AIRL pipeline · {reward_dir.name} · {goal.parents[2].name}',
+                        'reward_model_path':str(reward_dir.relative_to(ROOT)),
+                        'planner_goal_path':str(goal.relative_to(ROOT)),
+                        'planner_diffusion_path':str(planner.relative_to(ROOT)),
+                        'reward_guide_path':str(guide.relative_to(ROOT)),
+                        'predictor_path':str(predictor.relative_to(ROOT)),
+                        'dataset_revision':revision})
+    return result
+
+
 def find_model(model_id):
     return next((m for m in model_catalog() if m['id']==model_id),None)
 
@@ -137,7 +195,36 @@ def start_job(kind,raw):
                 raw['scenario']=scenario_type
     if task not in TASK_REGISTRY:raise ValueError('未知实验任务')
     descriptor=TASK_REGISTRY[task]
-    if descriptor.status != 'available':raise ValueError(f'{descriptor.label} 尚未具备可运行的完整训练链：{descriptor.description}')
+    if descriptor.status != 'available' and task!='evaluation':
+        raise ValueError(f'{descriptor.label} 尚未具备可运行的完整训练链：{descriptor.description}')
+    if task=='evaluation':
+        if kind!='eval':raise ValueError('综合生成式 SR-AIRL 任务只允许评估')
+        calibration=read_json(ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',{}) or {}
+        if calibration.get('equivalence_status')!='passed' or not all(
+            calibration.get('metrics',{}).get(axis,{}).get(split,{}).get('passed',False)
+            for axis in ('longitudinal','lateral') for split in ('calibration_grid','held_out')):
+            raise ValueError('Action Adapter 标定尚未通过网格和留出集，不能运行综合闭环评估')
+        selected=next((m for m in srairl_pipeline_bundle_catalog() if m['id']==raw.get('pipeline_bundle_id')),None)
+        if selected is None:raise ValueError('请选择具有完整兼容检查点的 SR-AIRL ModelBundle')
+        c=clean_interaction_evaluation_request(raw)
+        c['model_bundle_id']=selected['id']
+        c['model_bundle_paths']={key:str((ROOT/selected[key]).resolve()) for key in (
+            'reward_model_path','planner_goal_path','planner_diffusion_path','reward_guide_path','predictor_path')}
+        with LOCK:
+            if PROCESS is not None and PROCESS.poll() is None:
+                previous=read_json(job_dir(ACTIVE)/'status.json',{})
+                if previous.get('state') not in ('completed','stopped','failed'):
+                    raise ValueError('已有任务运行中。请先停止或等待完成。')
+                try:PROCESS.wait(timeout=5)
+                except subprocess.TimeoutExpired:raise ValueError('上一个任务正在释放资源，请稍后再试。')
+            name=f'{time.strftime("%Y%m%d_%H%M%S")}_eval_{time.time_ns()%1000000:06d}'
+            directory=run_root('eval')/name;directory.mkdir(parents=True)
+            atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c))
+            atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
+            with (directory/'worker.log').open('w') as log:
+                PROCESS=subprocess.Popen([sys.executable,'-u',str(ROOT/'studio/worker.py'),'--job',str(directory)],cwd=ROOT,stdout=log,stderr=subprocess.STDOUT)
+            ACTIVE=name
+            return {'id':name}
     if task == 'srairl':
         c=clean_srairl_request(raw,kind)
         if kind=='eval':
@@ -240,7 +327,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed=urlparse(self.path);path=parsed.path;q=parse_qs(parsed.query)
         if path=='/api/catalog':
             calibration=read_json(ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',{})
-            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_expert_datasets=srairl_expert_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{}),srairl_action_calibration=calibration))
+            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_pipeline_bundles=srairl_pipeline_bundle_catalog(),srairl_expert_datasets=srairl_expert_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{}),srairl_action_calibration=calibration))
         if path=='/api/datasets/catalog':
             return self.respond(dataset_catalog())
         if path=='/api/jobs':

@@ -10,6 +10,7 @@ from pathlib import Path
 import os
 from datetime import datetime
 import warnings
+import hashlib
 warnings.filterwarnings('ignore')
 import argparse
 import json
@@ -92,7 +93,14 @@ def main(args):
                       ppo_clip=0.2,
                       dppo_gamma=0.99,
                       dppo_every=10,
-                      progress_callback=progress if args.studio_dir else None)
+                      progress_callback=progress if args.studio_dir else None,
+                      checkpoint_metadata={
+                          'obs_len': 20, 'horizon': 100, 'pred_len': 100, 'dt': 0.1,
+                          'transition_dim': 6,
+                          'n_diffusion_steps': 20,
+                          'dataset_revision': hashlib.sha256(Path(data_path).read_bytes()).hexdigest(),
+                          'normalization_version': 'planner-goal-v1',
+                      })
 
     # Main Loop
     print(f'Training planner for {args.steps} update steps')
