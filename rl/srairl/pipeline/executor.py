@@ -51,7 +51,7 @@ class SRAIRLClosedLoopPipeline:
     def __init__(self, *, planner, predictor, selector, tracker,
                  role_forecaster, candidate_count=16, replan_steps=5,
                  model_bundle=None, calibration_hash="", lane_state_mapper=None,
-                 planning_context_provider=None):
+                 planning_context_provider=None, procedural_warmup_steps=20):
         if candidate_count < 1 or replan_steps < 1:
             raise ValueError("candidate_count and replan_steps must be positive")
         self.planner = planner
@@ -65,6 +65,9 @@ class SRAIRLClosedLoopPipeline:
         self.calibration_hash = str(calibration_hash)
         self.lane_state_mapper = lane_state_mapper
         self.planning_context_provider = planning_context_provider
+        self.procedural_warmup_steps = int(procedural_warmup_steps)
+        if self.procedural_warmup_steps < 1:
+            raise ValueError("procedural MetaDrive requires a positive history warm-up")
 
     @staticmethod
     def _environment_roles(env):
@@ -111,10 +114,25 @@ class SRAIRLClosedLoopPipeline:
         reset_result = env.reset(seed=seed) if "seed" in reset_parameters else env.reset()
         roles = self._environment_roles(env)
         history = RoleHistoryBuffer(20)
-        initial_rows = self._initial_history(env, roles)
-        history.reset(initial_rows[0])
-        for row in initial_rows[1:]:
-            history.append(row)
+        warmup_steps = 0
+        if getattr(env, "scene_source", None) == "procedural":
+            if not hasattr(env, "begin_evaluation_phase"):
+                raise RuntimeError("procedural MetaDrive environment must support evaluation-phase reset after warm-up")
+            history.reset(roles)
+            for _ in range(self.procedural_warmup_steps):
+                _, warmup_info = env.warmup_step()
+                if warmup_info.get("done", False):
+                    raise RuntimeError("procedural environment terminated during the 2-second history warm-up")
+                history.append(self._environment_roles(env))
+                warmup_steps += 1
+            env.begin_evaluation_phase(warmup_steps=warmup_steps)
+        else:
+            initial_rows = self._initial_history(env, roles)
+            history.reset(initial_rows[0])
+            for row in initial_rows[1:]:
+                history.append(row)
+        evaluation_start_states = {role: values[-1].tolist()
+                                   for role, values in history.current().items()}
         metrics = EpisodeMetrics()
         decisions = 0
         done = False
@@ -138,6 +156,7 @@ class SRAIRLClosedLoopPipeline:
             joint = build_joint_candidates(
                 proposals, self.predictor, state_history["rfv"],
                 rlv_current, rlv_target, dt=0.1,
+                seed=int(seed) + 1000 * decisions,
             )
             metrics.predictor_latency_s.append(time.perf_counter() - started)
             selected, returns = self.selector.select(joint, history=state_history)
@@ -150,7 +169,8 @@ class SRAIRLClosedLoopPipeline:
 
             if self.model_bundle is not None:
                 bundle = CandidateBundle(
-                    schema_version="srairl-candidate-bundle-v1",
+                    schema_version="srairl-candidate-bundle-v2",
+                    time_semantics="future_only_t_plus_dt_through_t_plus_horizon_dt",
                     scenario_id=scenario_id or getattr(env.scenario, "scenario_id", "unknown"),
                     planning_step=decisions, dt=0.1, horizon=100,
                     history=state_history, candidates=joint,
@@ -191,4 +211,6 @@ class SRAIRLClosedLoopPipeline:
         metrics.update_environment(last_info)
         return {"metrics": metrics, "last_info": last_info,
                 "model_bundle": self._provenance(),
+                "warmup_steps": warmup_steps, "warmup_duration_s": warmup_steps * 0.1,
+                "evaluation_start_states": evaluation_start_states,
                 "reset_info": reset_result[1] if isinstance(reset_result, tuple) and len(reset_result) > 1 else {}}

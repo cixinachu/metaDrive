@@ -151,7 +151,7 @@ class InteractionEvaluationTask:
             if hasattr(env, "frame_callback"):
                 env.frame_callback = old_callback
         result["calibration_hash"] = self.calibration_hash
-        result["evaluation_protocol"] = "closed_loop_metadrive_receding_horizon"
+        result["evaluation_protocol"] = "closed_loop_metadrive_receding_horizon_future_only_v2"
         if output_path:
             try:
                 metadrive_version = importlib.metadata.version("metadrive-simulator")
@@ -166,6 +166,10 @@ class InteractionEvaluationTask:
                                                           "scene_source": getattr(env, "scene_source", "ngsim"),
                                                           "initialization_source": "ngsim_distribution" if getattr(env, "current_initial_state", None) else "canonical",
                                                           "initial_state_dataset_id": None if not getattr(env, "current_initial_state", None) else env.current_initial_state.get("dataset_id"),
+                                                          "warmup_steps": result["warmup_steps"],
+                                                          "warmup_duration_s": result["warmup_duration_s"],
+                                                          "evaluation_start_states": result["evaluation_start_states"],
+                                                          "candidate_time_semantics": "future_only_t_plus_dt_through_t_plus_horizon_dt",
                                                           "metadrive_version": metadrive_version,
                                                           "calibration_hash": self.calibration_hash})
         return result

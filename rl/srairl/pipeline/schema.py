@@ -27,7 +27,7 @@ class PlanningContext:
 
 @dataclass(frozen=True)
 class TrajectoryCandidate:
-    """Upstream physical state [y, x, vx, vy], actions [ax, ay]."""
+    """Future-only states [y, x, vx, vy] at t+dt ... t+T*dt; actions [ax, ay]."""
     states: np.ndarray
     actions: np.ndarray | None = None
     dt: float = 0.1
@@ -66,7 +66,9 @@ class JointCandidate:
 
 @dataclass
 class CandidateBundle:
+    """Versioned bundle whose candidates begin at t+dt, never at the observation time."""
     schema_version: str
+    time_semantics: str
     scenario_id: str
     planning_step: int
     dt: float
@@ -83,8 +85,10 @@ class CandidateBundle:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.schema_version != "srairl-candidate-bundle-v1":
+        if self.schema_version != "srairl-candidate-bundle-v2":
             raise ValueError(f"unsupported CandidateBundle schema: {self.schema_version}")
+        if self.time_semantics != "future_only_t_plus_dt_through_t_plus_horizon_dt":
+            raise ValueError(f"unsupported CandidateBundle time semantics: {self.time_semantics}")
         if self.horizon < 1 or self.dt <= 0 or not np.isfinite(self.dt):
             raise ValueError("horizon and dt must be positive")
         required = {"elcv", "rfv", "rlv_current", "rlv_target"}

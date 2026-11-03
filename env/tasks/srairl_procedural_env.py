@@ -28,11 +28,14 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         if rfv_response not in {'policy','fixed_speed','scripted_yield','scripted_gap_closing'}:
             raise ValueError(f'unsupported RFV response: {rfv_response}')
         self.rfv_response=rfv_response
+        self.seed=int(seed)
         self.scenario_type=scenario_type
         self.lane_num=int(lane_num)
         self._is_merge=scenario_type=='merge'
         self.scene_source="procedural"
-        self.max_steps=int(horizon)
+        self._warmup_policies={}
+        self._episode_horizon=int(horizon)
+        self.max_steps=self._episode_horizon
         states=np.asarray([
             [-.2,8.,0.,18.,0.],[-.1,8.,0.,18.,0.],
             [self.max_steps*.1,200.,0.,18.,0.],[(self.max_steps+1)*.1,202.,0.,18.,0.]
@@ -40,7 +43,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         tracks={str(i):{"id":str(i),"length":4.5,"width":1.8,"states":states.copy()} for i in range(4)}
         placeholder=SimpleNamespace(scenario_id=f"metadrive-{scenario_type}",elcv_id="0",rfv_id="1",
             rlv_current_id="2",rlv_target_id="3",tracks=tracks,start_time=0.,end_time=(self.max_steps+1)*.1)
-        world=SRAIRLProceduralWorld(scenario_type,lane_num,traffic_density,view_mode,seed,horizon,traffic_seed,
+        world=SRAIRLProceduralWorld(scenario_type,lane_num,traffic_density,view_mode,seed,horizon+20,traffic_seed,
                                    self.interaction_scenario)
         super().__init__(placeholder,dynamics_mode="metadrive_physics",config=config,metadrive_world=world)
         self.observer=SRAIRLObservationAdapter(self.config.history_len,
@@ -84,7 +87,10 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         return {"elcv":ego_state,"rfv":other_state,"rlv_current":current,"rlv_target":target}
 
     def reset(self,seed=None):
-        self.time=0.;self.steps=0;self._done=False;self._metadrive_collision=False;self._metadrive_out_of_road=False
+        self._close_warmup_policies()
+        self._active_seed=self.seed if seed is None else int(seed)
+        self.time=0.;self.steps=0;self.max_steps=self._episode_horizon
+        self._done=False;self._metadrive_collision=False;self._metadrive_out_of_road=False
         if self.initial_state_samples:
             from env.tasks.srairl_interaction import SRAIRLInteractionScenario
             if seed is not None:self._initial_state_rng=np.random.default_rng(int(seed)+0x5A17)
@@ -127,6 +133,11 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
             self._merge_start_x=float(ego.position[0])
             self._merge_end_x=self._merge_start_x+85.
             self._merge_complete_x=None
+            self._evaluation_start_s=self._merge_start_x
+            self._evaluation_end_s=self._merge_end_x
+        else:
+            self._evaluation_start_s=float(self.interaction_scenario.elcv_x)
+            self._evaluation_end_s=float(self.interaction_scenario.interaction_end_x)
         self._last_info={"done":False,"time":0.,"distance_travelled_m":0.,"tracking_reward":0.,
                          "collision_proxy_any":False,"controlled_collision_proxy":False,
                          "metadrive_primary_collision":False,"metadrive_out_of_road":False,
@@ -134,6 +145,72 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         if self.frame_callback:self.frame_callback(self,self._last_info)
         return {"elcv":obs.copy(),"rfv":obs.copy()},dict(scenario_id=self.scenario.scenario_id,
             dynamics_mode="metadrive_physics",scene_source="procedural",**world_info)
+
+    def begin_evaluation_phase(self, warmup_steps=20):
+        """Start measured episode time after collecting physical history frames."""
+        if self._done:
+            raise RuntimeError("cannot start evaluation after a terminated warm-up")
+        if int(warmup_steps) < 1:
+            raise ValueError("procedural evaluation requires at least one warm-up step")
+        self._close_warmup_policies()
+        ego=self.world.role_vehicle("elcv");rfv=self.world.role_vehicle("rfv")
+        self.steps=0;self.time=0.;self._done=False
+        self.max_steps+=int(warmup_steps)
+        self.distance_travelled_m=0.
+        self._last_position=np.asarray(ego.position[:2],dtype=float)
+        self._previous_progress=0.
+        self._lane_change_started=False;self._lane_change_completed=False
+        self._lane_change_stable=0;self._lane_change_start_time=None;self._lane_change_completion_time=None
+        self._metadrive_collision=False;self._metadrive_out_of_road=False
+        self._rfv_initial_speed=float(np.linalg.norm(rfv.velocity))
+        self._fixed_rfv_speed=self._rfv_initial_speed
+        self._rfv_min_accel=0.
+        roles=self._roles_live()
+        self._initial_gap=float(roles["rlv_target"][1]-roles["rfv"][1])
+        if self._is_merge:
+            self._merge_initial_route=(ego.lane_index[:2],rfv.lane_index[:2])
+            self._merge_start_x=float(ego.position[0])
+            self._merge_end_x=self._merge_start_x+85.
+            self._merge_complete_x=None
+            self._evaluation_start_s=self._merge_start_x
+            self._evaluation_end_s=self._merge_end_x
+        else:
+            ego_s=self._local_state(ego,self._source_lane)[1]-self.world._interaction_s_offset
+            self._evaluation_start_s=float(ego_s)
+            span=float(self.interaction_scenario.interaction_end_x-self.interaction_scenario.elcv_x)
+            self._evaluation_end_s=self._evaluation_start_s+span
+        self._last_info={"done":False,"time":0.,"distance_travelled_m":0.,
+                         "tracking_reward":0.,"collision_proxy_any":False,
+                         "controlled_collision_proxy":False,"metadrive_primary_collision":False,
+                         "metadrive_out_of_road":False,"minimum_distance_m":None,
+                         "traffic_vehicle_count":max(0,len(self._vehicle_pool())-4),
+                         "evaluation_start_s":self._evaluation_start_s,
+                         "warmup_steps":int(warmup_steps)}
+        return dict(evaluation_start_s=self._evaluation_start_s,
+                    evaluation_end_s=self._evaluation_end_s,warmup_steps=int(warmup_steps))
+
+    def _close_warmup_policies(self):
+        for policy in self._warmup_policies.values():
+            policy.destroy()
+        self._warmup_policies={}
+
+    def warmup_step(self):
+        """Advance controlled vehicles with MetaDrive IDM for physical history."""
+        from metadrive.policy.idm_policy import IDMPolicy
+        roles=("elcv","rfv")
+        for index,role in enumerate(roles):
+            if role not in self._warmup_policies:
+                vehicle=self.world.role_vehicle(role)
+                policy=IDMPolicy(vehicle,self._active_seed+index)
+                policy.enable_lane_change=False
+                self._warmup_policies[role]=policy
+        controls={role:np.asarray(self._warmup_policies[role].act(),dtype=np.float32)
+                  for role in roles}
+        self._warmup_control_override=controls
+        try:
+            return self.step({role:np.zeros(2,dtype=float) for role in roles})
+        finally:
+            self._warmup_control_override=None
 
     def step(self,actions):
         if self._done:raise RuntimeError("call reset after the interaction episode ends")
@@ -146,7 +223,10 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         if self.rfv_response=='fixed_speed':policy_actions['rfv']=np.asarray([0.,0.])
         elif self.rfv_response=='scripted_yield' and self._lane_change_started:policy_actions['rfv'][0]=-1.
         elif self.rfv_response=='scripted_gap_closing' and self._lane_change_started:policy_actions['rfv'][0]=.75
-        controls={role:self._to_metadrive_action(self.world.role_vehicle(role),policy_actions[role]) for role in ("elcv","rfv")}
+        override=getattr(self,"_warmup_control_override",None)
+        controls=override if override is not None else {
+            role:self._to_metadrive_action(self.world.role_vehicle(role),policy_actions[role])
+            for role in ("elcv","rfv")}
         _,_,terminated,truncated,world_info=self.world.step(controls)
         if self.rfv_response=='fixed_speed':
             vehicle=self.world.role_vehicle('rfv');lane=vehicle.lane
@@ -165,7 +245,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
             self._lane_change_stable=self._lane_change_stable+1 if self._lane_change_started and in_shared_target_lane else 0
         else:
             lateral_from_source=abs(self._local_state(ego,self._source_lane)[0])
-            if not self._lane_change_started and lateral_from_source>=.25 and self.interaction_scenario.interaction_start_x<=ego_source_longitudinal<=self.interaction_scenario.interaction_end_x:
+            if not self._lane_change_started and lateral_from_source>=.25 and self._evaluation_start_s<=ego_source_longitudinal<=self._evaluation_end_s:
                 self._lane_change_started=True;self._lane_change_start_time=self.time
             _,ego_target_lateral=target_lane.local_coordinates(ego.position[:2])
             self._lane_change_stable=self._lane_change_stable+1 if self._lane_change_started and abs(float(ego_target_lateral))<=self.interaction_scenario.success_lateral_tolerance_m else 0
@@ -191,8 +271,8 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
                 if lateral_clearance>(actor.WIDTH+other.WIDTH)*.5+.75:continue
                 gap=other_state[1]-actor_state[1];closing=actor_state[2]-other_state[2]
                 if gap>0. and closing>1e-6:ttcs.append(max(0.,gap-(actor.LENGTH+other.LENGTH)*.5)/closing)
-        zone_end=self._merge_end_x if self._is_merge else self.interaction_scenario.interaction_end_x
-        zone_start=self._merge_start_x if self._is_merge else self.interaction_scenario.elcv_x
+        zone_end=self._evaluation_end_s
+        zone_start=self._evaluation_start_s
         zone_exited=ego_zone_s>=zone_end
         merge_lane_at_exit=bool(self.world.role_vehicle('elcv').lane_index[0] in ('1r0_0_','1r0_1_') and
                                 self.world.role_vehicle('elcv').lane_index[2]==2)
@@ -235,4 +315,5 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         return {"elcv":obs.copy(),"rfv":obs.copy()},info
 
     def close(self):
+        self._close_warmup_policies()
         if self.world is not None:self.world.close()

@@ -103,7 +103,20 @@ class PlannerInference:
         array = samples.detach().cpu().numpy()
         candidates = []
         for row in array:
-            states = row[:, 2:6].copy()
+            sampled = row[:, 2:6].copy()
+            actions = row[:, :2].copy()
+            # The diffusion checkpoint is trained with the observation at
+            # index 0. Runtime candidates are future-only, so retain t+0.1
+            # through t+9.9 and append a kinematic t+10.0 state.
+            states = sampled[1:].copy()
+            final = sampled[-1].copy()
+            ax, ay = actions[-1]
+            final[0] += final[3] * 0.1 + 0.5 * ay * 0.1 ** 2
+            final[1] += final[2] * 0.1 + 0.5 * ax * 0.1 ** 2
+            final[2] += ax * 0.1
+            final[3] += ay * 0.1
+            states = np.concatenate([states, final[None, :]], axis=0)
+            future_actions = np.concatenate([actions[1:], actions[-1:]], axis=0)
             states[:, :2] += self._origin
-            candidates.append(TrajectoryCandidate(states=states, actions=row[:, :2], dt=0.1))
+            candidates.append(TrajectoryCandidate(states=states, actions=future_actions, dt=0.1))
         return candidates

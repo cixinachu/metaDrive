@@ -19,7 +19,7 @@ def forecast_rlv_roles(env, history, horizon=100, dt=0.1):
             track = scenario.tracks[ident]
             rows = []
             for index in range(horizon):
-                t = float(env.time) + index * dt
+                t = float(env.time) + (index + 1) * dt
                 state = env._sample(track, t)
                 if state is None:
                     raise ValueError(f"recorded {role} trajectory ends before planner horizon at t={t:.2f}")
@@ -41,7 +41,7 @@ def forecast_rlv_roles(env, history, horizon=100, dt=0.1):
             rows = []
             elapsed = float(getattr(world, "_interaction_elapsed", 0.0))
             for index in range(horizon):
-                lane, local = world._path_position(path, s0 + speed * (elapsed + index * dt))
+                lane, local = world._path_position(path, s0 + speed * (elapsed + (index + 1) * dt))
                 position = np.asarray(lane.position(local, 0.0), dtype=float)
                 heading = float(lane.heading_theta_at(local))
                 rows.append([position[1], position[0], speed * np.cos(heading), speed * np.sin(heading)])
@@ -58,7 +58,7 @@ def forecast_rlv_roles(env, history, horizon=100, dt=0.1):
                              [np.cos(lane.heading_theta_at(s0)), np.sin(lane.heading_theta_at(s0))]))
         rows = []
         for index in range(horizon):
-            local = float(s0) + speed * index * dt
+            local = float(s0) + speed * (index + 1) * dt
             position = np.asarray(lane.position(local, lateral), dtype=float)[:2]
             heading = float(lane.heading_theta_at(local))
             velocity = speed * np.asarray([np.cos(heading), np.sin(heading)])

@@ -4,6 +4,7 @@ import torch
 
 from env.tasks.srairl_trajectory_tracker import SRAIRLTrajectoryTracker
 from rl.srairl.pipeline.coordinates import lane_state_to_upstream, upstream_to_lane_state
+from rl.srairl.pipeline.candidate_builder import build_joint_candidates
 from rl.srairl.pipeline.executor import RoleHistoryBuffer, SRAIRLClosedLoopPipeline
 from rl.srairl.pipeline.model_bundle import SRAIRLModelBundle
 from rl.srairl.pipeline.normalization import (
@@ -110,13 +111,18 @@ def test_planner_inference_loads_metadata_checkpoints_and_uses_target_lane(tmp_p
     observed = {}
     def sample(conditions, verbose=False):
         observed.update({key: value.clone() for key, value in conditions.items()})
-        return SimpleNamespace(trajectories=torch.zeros((1, 100, 6)))
+        trajectories = torch.zeros((1, 100, 6))
+        trajectories[0, :, 3] = torch.arange(100, dtype=torch.float32)
+        trajectories[0, :, 4] = 10.0
+        return SimpleNamespace(trajectories=trajectories)
     inference.diffusion.conditional_sample = sample
     candidates = inference.generate_candidates(history, PlanningContext(3.5), num_candidates=1, seed=7)
     assert len(candidates) == 1
     assert torch.allclose(observed[0][0], torch.tensor([0.0, 19.0, 10.0, 0.0]))
     assert torch.allclose(observed[99][0, 0], torch.tensor(3.5))
     assert torch.allclose(observed[99][0, 3], torch.tensor(0.0))
+    assert candidates[0].states[0, 1] == pytest.approx(1.0)
+    assert candidates[0].states[-1, 1] == pytest.approx(100.0)
 
 
 def test_predictor_inference_loads_checkpoints_and_reconstructs_physical_state(tmp_path):
@@ -144,10 +150,41 @@ def test_predictor_inference_loads_checkpoints_and_reconstructs_physical_state(t
     elcv = trajectory(0., 20.)
     current = trajectory(0., 40., actions=False)
     target = trajectory(3.5, 50., actions=False)
-    predicted = inference.predict(history, elcv, current, target)
+    rng_state = torch.random.get_rng_state()
+    predicted = inference.predict(history, elcv, current, target, seed=19)
+    repeated = inference.predict(history, elcv, current, target, seed=19)
+    assert torch.equal(torch.random.get_rng_state(), rng_state)
     assert predicted.states.shape == (100, 4)
     assert predicted.actions.shape == (100, 2)
     assert np.isfinite(predicted.states).all() and np.isfinite(predicted.actions).all()
+    assert np.array_equal(predicted.states, repeated.states)
+
+
+def test_procedural_warmup_produces_real_history_then_resets_episode_metrics():
+    from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+
+    env = SRAIRLProceduralEnv("curve", lane_num=3, traffic_density=0., seed=17, horizon=100)
+    try:
+        env.reset(seed=17)
+        initial = env._roles_live()
+        history = RoleHistoryBuffer(20)
+        history.reset(initial)
+        for _ in range(20):
+            _, info = env.warmup_step()
+            assert not info["done"]
+            history.append(env._roles_live())
+        actual = history.current()
+        assert np.ptp(actual["elcv"][:, 1]) > 10.0
+        assert actual["elcv"][-1, 1] > actual["elcv"][0, 1]
+        phase = env.begin_evaluation_phase(warmup_steps=20)
+        assert phase["warmup_steps"] == 20
+        assert env.steps == 0 and env.time == 0.0
+        assert env.distance_travelled_m == 0.0
+        assert not env._metadrive_collision and not env._metadrive_out_of_road
+        expected_start = actual["elcv"][-1, 1] - env.world._interaction_s_offset
+        assert phase["evaluation_start_s"] == pytest.approx(expected_start)
+    finally:
+        env.close()
 
 
 def test_training_normalizers_and_four_dimensional_delta_reconstruction():
@@ -160,6 +197,51 @@ def test_training_normalizers_and_four_dimensional_delta_reconstruction():
     assert future.shape == (3, 4)
     assert np.allclose(future[-1], [1.0, 12.0, 5.6, 0.0])
     assert np.allclose(acceleration[:, 0], 2.0)
+
+
+def test_rlv_forecast_starts_at_next_timestep():
+    from rl.srairl.pipeline.role_forecasting import forecast_rlv_roles
+
+    class Vehicle:
+        def __init__(self, x):
+            self.position = np.asarray([x, 0.0, 0.0])
+            self.velocity = np.asarray([10.0, 0.0, 0.0])
+            self.lane = StraightLane()
+
+    class World:
+        def __init__(self):
+            self.roles = {"rlv_current": Vehicle(20.0), "rlv_target": Vehicle(40.0)}
+
+        def role_vehicle(self, role):
+            return self.roles[role]
+
+    class LaneEnv:
+        scene_source = "procedural"
+        scenario_type = "straight"
+        _source_lane = StraightLane()
+        world = World()
+
+    current, target = forecast_rlv_roles(LaneEnv(), {}, horizon=100, dt=0.1)
+    assert current.states[0, 1] == pytest.approx(21.0)
+    assert current.states[-1, 1] == pytest.approx(120.0)
+    assert target.states[0, 1] == pytest.approx(41.0)
+
+
+def test_joint_candidate_predictor_seed_is_episode_step_and_candidate_id():
+    class Predictor:
+        def __init__(self):
+            self.seeds = []
+
+        def predict(self, rfv_history, elcv_future, rlv_current_future,
+                    rlv_target_future, *, seed):
+            self.seeds.append(seed)
+            return trajectory(0., -12.)
+
+    predictor = Predictor()
+    build_joint_candidates([trajectory(), trajectory(1.)], predictor,
+                           np.zeros((20, 4)), trajectory(actions=False),
+                           trajectory(1., actions=False), seed=2017)
+    assert predictor.seeds == [2017, 2018]
 
 
 def test_reward_guide_gradient_is_per_step_and_depends_on_predicted_fv():
@@ -288,7 +370,8 @@ def test_one_closed_loop_episode_executes_dual_tracker_and_replans():
             return [trajectory(0.0, 0.0)]
 
     class Predictor:
-        def predict(self, rfv_history, elcv_future, rlv_current_future, rlv_target_future):
+        def predict(self, rfv_history, elcv_future, rlv_current_future, rlv_target_future, *, seed):
+            assert seed in {9, 1009}
             return trajectory(0.0, -12.0)
 
     class Forecaster:
@@ -308,4 +391,6 @@ def test_one_closed_loop_episode_executes_dual_tracker_and_replans():
     assert result["metrics"].planning_steps == 2
     assert result["metrics"].selected_candidate_ids == [0, 0]
     assert result["metrics"].lane_change_success
+    assert result["warmup_steps"] == 0
+    assert result["evaluation_start_states"]["elcv"] == [0., 0., 10., 0.]
     assert result["last_info"]["done"]

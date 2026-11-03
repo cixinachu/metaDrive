@@ -51,7 +51,7 @@ class RewardGuidedResponsePredictor:
             raise ValueError(f"{name} checkpoint dimensions are incompatible")
 
     @torch.no_grad()
-    def predict(self, rfv_history, elcv_future, rlv_current_future, rlv_target_future):
+    def predict(self, rfv_history, elcv_future, rlv_current_future, rlv_target_future, *, seed):
         history = np.asarray(rfv_history, dtype=np.float32)
         if history.shape != (20, 4) or not np.isfinite(history).all():
             raise ValueError("RFV history must be finite [20,4] [y,x,vx,vy]")
@@ -77,9 +77,17 @@ class RewardGuidedResponsePredictor:
         # The sampler remains differentiable only through its reward guide.
         # All model parameters are frozen by eval(); gradients are needed for
         # the candidate deltas during classifier guidance.
-        with torch.enable_grad():
-            deltas, _ = self.sampler(node_loc=torch.zeros((1, 100, 4), device=self.device),
-                                     context=context, state=state, guide=self.guide)
+        device_index = (self.device.index if self.device.index is not None else torch.cuda.current_device()) \
+            if self.device.type == "cuda" else None
+        devices = [device_index] if device_index is not None else []
+        with torch.random.fork_rng(devices=devices):
+            seed = int(seed) % (2 ** 63 - 1)
+            torch.random.default_generator.manual_seed(seed)
+            if device_index is not None:
+                torch.cuda.default_generators[device_index].manual_seed(seed)
+            with torch.enable_grad():
+                deltas, _ = self.sampler(node_loc=torch.zeros((1, 100, 4), device=self.device),
+                                         context=context, state=state, guide=self.guide)
         reconstructed, accel = reconstruct_predictor_deltas(
             history, deltas[0].detach().cpu().numpy(), dt=0.1)
         return TrajectoryCandidate(reconstructed, actions=accel, dt=0.1)
