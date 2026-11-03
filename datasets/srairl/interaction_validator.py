@@ -103,7 +103,10 @@ def extract_initial_state_distribution(scenario, *, samples=5, window_s=2.0):
             'rlv_current':scenario.tracks[scenario.rlv_current_id],'rlv_target':scenario.tracks[scenario.rlv_target_id]}
     times=np.asarray(tracks['elcv']['states'],dtype=float)[:,0]
     onset=float(result['lane_change_time_s']);start=max(float(times[0]),onset-float(window_s))
-    candidates=np.linspace(start,onset,int(samples)) if int(samples)>1 else np.asarray([onset])
+    cadence=float(np.median(np.diff(times))) if len(times)>1 else .1
+    prechange_end=onset-cadence
+    if prechange_end<start-1e-9:return []
+    candidates=np.linspace(start,prechange_end,int(samples)) if int(samples)>1 else np.asarray([prechange_end])
     heading=float(result['road_heading_rad']);tangent=np.asarray([np.cos(heading),np.sin(heading)])
     normal=np.asarray([-tangent[1],tangent[0]])
     all_lateral=[]

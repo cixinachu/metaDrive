@@ -26,7 +26,8 @@ def test_ngsim_roles_must_form_a_real_gap_acceptance_event():
     assert result['valid'] and result['source_lane']==0 and result['target_lane']==1
     assert result['initial_state']['elcv_rfv_gap_m']==pytest.approx(10.)
     samples=extract_initial_state_distribution(scenario,samples=4,window_s=.3)
-    assert len(samples)==3
+    assert len(samples)==4
+    assert all(sample['time_s']<result['lane_change_time_s'] for sample in samples)
     assert all(sample['elcv_rfv_gap_m']>0 and sample['rlv_target_gap_m']>0 for sample in samples)
     assert SRAIRLInteractionScenario.from_ngsim_initial_state(samples[0]).validate(2).target_lane==1
     tracks['f']=track('f',30.,3.7)

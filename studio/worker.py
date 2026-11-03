@@ -27,6 +27,30 @@ from rl.algorithms import create_model, load_model, REGISTRY
 from studio.config import environment_config, atomic_json
 
 
+def action_calibration_passed(summary):
+    if not isinstance(summary,dict) or summary.get('equivalence_status')!='passed':return False
+    metrics=summary.get('metrics',{})
+    return all(metrics.get(axis,{}).get(split,{}).get('passed') is True
+               for axis in ('longitudinal','lateral')
+               for split in ('calibration_grid','held_out'))
+
+
+def srairl_experiment_protocol(settings,calibration_passed=False):
+    source=settings.get('scene_source','ngsim')
+    dynamics=settings.get('dynamics_mode','legacy_kinematic')
+    reactive=bool(settings.get('srairl_reactive_background',False))
+    scenario=settings.get('scenario','straight')
+    if source=='ngsim' and dynamics=='legacy_kinematic' and not reactive:
+        return {'id':'A','name':'NGSIM legacy fixed-replay reproduction','qualification':'reproduction'}
+    if source=='ngsim' and dynamics=='legacy_kinematic' and reactive:
+        return {'id':'B','name':'NGSIM reactive-background sensitivity','qualification':'sensitivity_only'}
+    if source=='procedural' and dynamics=='metadrive_physics' and scenario in ('straight','curve','merge'):
+        protocol='D' if scenario=='merge' else 'C'
+        return {'id':protocol,'name':'MetaDrive ramp-merge transfer' if protocol=='D' else 'MetaDrive lane-change transfer',
+                'qualification':'quantitative_transfer' if calibration_passed else 'exploratory_only'}
+    return {'id':'custom','name':'Custom SR-AIRL experiment','qualification':'exploratory_only'}
+
+
 class Recorder(KVWriter):
     def __init__(self, directory):
         self.directory = directory
@@ -625,7 +649,8 @@ def evaluate_srairl_procedural(directory,c,env,policies,training):
                 **({'evaluation/minimum_ttc_s':row['minimum_ttc_s']} if row['minimum_ttc_s'] is not None else {})},step=steps)
         calibration_path=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json'
         calibration=json.loads(calibration_path.read_text()) if calibration_path.is_file() else None
-        calibration_passed=bool(calibration and calibration.get('equivalence_status')=='passed')
+        calibration_passed=action_calibration_passed(calibration)
+        protocol=srairl_experiment_protocol(c,calibration_passed)
         summary=dict(algorithm='SR-AIRL',episodes=int(completed),global_steps=steps,
             scene_source='procedural',scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
             initialization_protocol=c.get('initialization_protocol','canonical'),
@@ -649,7 +674,8 @@ def evaluate_srairl_procedural(directory,c,env,policies,training):
                 rfv_initial_road='mainline: >>> → 1r0_0_',target_mainline_lane_index=2,
                 downstream_route_shared=bool(info.get('merge_route_valid'))) if c['scenario']=='merge' else None),
             quantitative_transfer_evaluation_allowed=calibration_passed,
-            experiment_status='quantitative' if calibration_passed else 'exploratory_only',
+            experiment_protocol=protocol,
+            experiment_status=protocol['qualification'],
             interpretation=('Four-role lane-change interaction evaluation: ELCV, RFV, RLV_current and RLV_target are explicit; '
                 'the two leader trajectories are fixed-speed and only the ELCV/RFV are policy controlled. '
                 +('Action calibration passed.' if calibration_passed else 'Action calibration failed or is missing; MetaDrive physics results are exploratory only.')))
@@ -744,8 +770,9 @@ def evaluate_srairl(directory,c):
             if row['minimum_ttc_s'] is not None:recorder.write({'evaluation/minimum_ttc_s':row['minimum_ttc_s']},step=steps)
         calibration_path=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json'
         calibration=json.loads(calibration_path.read_text()) if calibration_path.is_file() else None
-        calibration_passed=bool(calibration and calibration.get('equivalence_status')=='passed')
+        calibration_passed=action_calibration_passed(calibration)
         physics_mode=c.get('dynamics_mode')=='metadrive_physics'
+        protocol=srairl_experiment_protocol(c,calibration_passed)
         summary=dict(algorithm='SR-AIRL',episodes=len(episode_rows),global_steps=steps,
                      tracking_return=returns if episode_rows else None,
                      mean_position_error_m=float(np.mean(errors)) if errors else None,
@@ -760,8 +787,9 @@ def evaluate_srairl(directory,c):
                      scenario_id=scenario.scenario_id,dynamics_mode=c.get('dynamics_mode','legacy_kinematic'),metadrive_world=bool(c.get('metadrive_world',True)),
                      traffic_reactive=bool(c.get('srairl_reactive_background',True)),collision_metric='axis_aligned_proxy',
                      action_calibration=calibration if physics_mode else None,
-                     quantitative_transfer_evaluation_allowed=bool(physics_mode and calibration_passed),
-                     experiment_status=('quantitative' if calibration_passed else 'exploratory_only') if physics_mode else 'ngsim_trajectory_reproduction',
+                     quantitative_transfer_evaluation_allowed=bool(protocol['qualification']=='quantitative_transfer'),
+                     experiment_protocol=protocol,
+                     experiment_status=protocol['qualification'],
                      background_dynamics='bounded IDM-like longitudinal response around recorded NGSIM reference; not calibrated human-driver dynamics',
                      result_interpretation=(('Both SR-AIRL actors use MetaDrive vehicle physics. '+('Full-grid action calibration passed.' if calibration_passed else 'Action calibration failed or is missing; these results are exploratory only. ')+ 'Background response is not fitted to human-driver data.')
                          if physics_mode else
