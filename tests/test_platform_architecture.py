@@ -185,28 +185,58 @@ def test_srairl_state_dict_checkpoint_loads_as_upstream_reward_guide():
         assert not restored.training
 
 
-def test_reward_guide_request_requires_a_prior_srairl_model():
+def _native_component_archive(tmp_path, monkeypatch):
+    import json
+    import studio.config as config
+    monkeypatch.setattr(config,'ROOT',tmp_path)
+    root=tmp_path/'datasets'/'srairl'/'metadrive';root.mkdir(parents=True)
+    n=121;episodes=3
+    states=np.zeros((n*episodes,4,4),dtype=np.float64)
+    for episode in range(episodes):
+        start=episode*n
+        states[start:start+n,0,0]=np.arange(n)*2.
+        states[start:start+n,:,2]=20.
+    np.savez_compressed(root/'native.npz',role_order=np.asarray(['elcv','rfv','rlv_current','rlv_target']),
+        role_states=states,trajectory_times_s=np.tile(np.arange(n)*.1,episodes),
+        trajectory_state_offsets=np.arange(episodes+1)*n,
+        trajectory_desired_acceleration=np.zeros((episodes*100,2,2),dtype=np.float32),
+        trajectory_metadrive_actions=np.zeros((episodes*100,2,2),dtype=np.float32),
+        trajectory_actual_acceleration=np.zeros((episodes*100,2,2),dtype=np.float32),
+        trajectory_reference_states_frenet=states.copy(),
+        trajectory_lane_indices=np.full((n*episodes,4),'main/road/0',dtype='U32'),
+        trajectory_action_offsets=np.arange(episodes+1)*100,
+        trajectory_metadata=np.asarray(json.dumps([dict(seed=100+i,scenario='straight',warmup_steps=20,
+            split=split) for i,split in enumerate(('train','validation','test'))])))
+    return 'datasets/srairl/metadrive/native.npz'
+
+
+def test_reward_guide_request_requires_a_prior_srairl_model(tmp_path,monkeypatch):
     from studio.config import clean_reward_guide_request
     with pytest.raises(ValueError, match="选择已完成"):
         clean_reward_guide_request({}, "train")
+    dataset_id=_native_component_archive(tmp_path,monkeypatch)
     config = clean_reward_guide_request({"srairl_model_id": "models/example",
         "upstream_epochs": 2, "upstream_batch_size": 4, "upstream_seed": 5,
-        "upstream_device": "cpu"}, "train")
+        "upstream_device": "cpu",'srairl_expert_dataset_id':dataset_id}, "train")
     assert config["task"] == "reward_guide"
     assert config["epochs"] == 2
+    assert config['dataset_id']==[dataset_id]
 
 
-def test_upstream_planner_and_predictor_requests_validate_stage_inputs():
+def test_upstream_planner_and_predictor_requests_validate_stage_inputs(tmp_path,monkeypatch):
     from studio.config import clean_planner_request, clean_predictor_request
+    dataset_id=_native_component_archive(tmp_path,monkeypatch)
     planner = clean_planner_request({"planner_goal_epochs": 2, "planner_dppo_steps": 3,
-        "upstream_batch_size": 4, "upstream_seed": 5, "upstream_device": "cpu"}, "train")
+        "upstream_batch_size": 4, "upstream_seed": 5, "upstream_device": "cpu",
+        'srairl_expert_dataset_id':dataset_id}, "train")
     assert (planner["goal_epochs"], planner["dppo_steps"]) == (2, 3)
     with pytest.raises(ValueError, match="闭环评估接口"):
         clean_planner_request({}, "eval")
     predictor = clean_predictor_request({"reward_guide_model_id": "models/guide",
         "upstream_epochs": 2, "upstream_batch_size": 4, "upstream_seed": 5,
-        "upstream_device": "cpu"}, "train")
+        "upstream_device": "cpu",'srairl_expert_dataset_id':dataset_id}, "train")
     assert predictor["task"] == "predictor"
+    assert predictor['dataset_id']==[dataset_id]
 
 
 def test_expert_builder_keeps_two_actor_actions_separate_and_requires_preroll():
@@ -223,35 +253,58 @@ def test_supplied_reward_config_values_are_the_sr_airl_defaults():
     from rl.srairl.config import SRAIRLConfig
     from rl.srairl import reward_config
     c = SRAIRLConfig.from_mapping()
-    assert (c.frame_state_dim, c.history_len, c.gamma) == (16, 4, .99)
+    assert (c.frame_state_dim, c.history_len, c.gamma) == (16, 11, .99)
     assert (c.potential_longitudinal_scale, c.potential_lateral_scale, c.direction_lambda, c.alpha_init) == (15., 3.5, .3, .1)
     assert (c.pos_lat_scale, c.pos_long_scale, c.vel_scale, c.vel_offset) == (25., 500., 80., -40.)
     assert reward_config.FRAME_STATE_DIM == 16
 
 
-def test_studio_srairl_request_requires_explicit_distinct_ngsim_roles(monkeypatch):
+def test_temporal_reward_and_counterfactual_preference_use_full_history():
+    import torch
+    from rl.srairl.config import SRAIRLConfig
+    from rl.srairl.discriminator import TemporalConvReward
+    from rl.srairl.trainer import counterfactual_preference_mask
+    cfg=SRAIRLConfig.from_mapping()
+    model=TemporalConvReward(cfg.history_len)
+    assert model(torch.zeros(2,cfg.history_len,4)).shape==(2,1)
+    with pytest.raises(ValueError,match="TCN expects"):
+        model(torch.zeros(2,4,4))
+    states=torch.zeros(1,cfg.history_len,16)
+    states[:,:,2]=(10.-cfg.vel_offset)/cfg.vel_scale
+    states[:,-1,5]=8./cfg.pos_long_scale
+    states[:,-1,6]=-2./cfg.vel_scale
+    counterfactual,eligible=counterfactual_preference_mask(states.reshape(1,-1),cfg)
+    assert eligible.tolist()==[True]
+    assert torch.isclose(counterfactual.reshape(1,cfg.history_len,16)[:,-1,5],
+                         torch.tensor([3./cfg.pos_long_scale])).all()
+
+
+def test_studio_rejects_legacy_trajectory_inputs_for_metadrive_only_protocol():
+    from studio.config import clean_request, clean_srairl_request
+    with pytest.raises(ValueError, match="无效 data_source"):
+        clean_request({"data_source":"ngsim"},"train")
+    with pytest.raises(ValueError, match="只使用 MetaDrive"):
+        clean_srairl_request({"srairl_scene_source":"ngsim"},"eval")
+    with pytest.raises(ValueError, match="不接受轨迹回放"):
+        clean_srairl_request({"srairl_scenarios":[{"dataset_id":"legacy","roles":{}}]},"eval")
+    with pytest.raises(ValueError, match="MetaDrive 专家示范数据集"):
+        clean_srairl_request({"srairl_operation":"interaction"},"train")
+
+
+def test_expert_collection_accepts_batch_of_three_metadrive_maps():
     from studio.config import clean_srairl_request
-    import datasets.importer
-    times=np.arange(-.2,.41,.1)
-    offsets=[(0,0),(-10,3.5),(15,0),(15,3.5)]
-    tracks=[{"id":str(i),"states":[[t,x+10*t,y,10.,0.] for t in times],"length":4.5,"width":1.8}
-            for i,(x,y) in enumerate(offsets)]
-    for row in tracks[0]["states"]:
-        if row[0]>.0:row[2]=3.5
-    clip={"tracks":tracks,"lane_num":3,"lane_width":3.5,"road_length":100}
-    monkeypatch.setattr(datasets.importer,"load_clip",lambda _id:(clip,{"source":"ngsim","split":"train","id":"a"*24}))
-    request=clean_srairl_request({"srairl_scenarios":[{"dataset_id":"a"*24,"roles":{
-        "elcv_id":"0","rfv_id":"1","rlv_current_id":"2","rlv_target_id":"3"}}],
-        "srairl_episodes":2,"srairl_ppo_epochs":2,"srairl_seed":0,"srairl_device":"cpu"},"train")
-    assert request["dynamics_mode"]=="legacy_kinematic"
-    assert request["srairl_reactive_background"] is False
-    with pytest.raises(ValueError,match="不同轨迹"):
-        clean_srairl_request({"srairl_scenarios":[{"dataset_id":"a"*24,"roles":{
-            "elcv_id":"0","rfv_id":"0","rlv_current_id":"2","rlv_target_id":"3"}}]},"train")
-    monkeypatch.setattr(datasets.importer,"load_clip",lambda _id:({"tracks":tracks},{"source":"ngsim","split":"eval","id":"a"*24}))
-    with pytest.raises(ValueError,match="train 数据片段"):
-        clean_srairl_request({"srairl_scenarios":[{"dataset_id":"a"*24,"roles":{
-            "elcv_id":"0","rfv_id":"1","rlv_current_id":"2","rlv_target_id":"3"}}]},"train")
+    request=clean_srairl_request({"srairl_operation":"expert_collect",
+        "srairl_collect_scenarios":["straight","curve","merge"],
+        "srairl_demo_episodes":3,"srairl_lane_num":3},"train")
+    assert request["scenarios"]==["straight","curve","merge"]
+    assert set(request["interaction_scenarios"])==set(request["scenarios"])
+    for scene in ('curve','merge'):
+        assert max(request['interaction_scenarios'][scene][key] for key in
+            ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'))<=6.
+    with pytest.raises(ValueError,match="至少需要三条"):
+        clean_srairl_request({"srairl_operation":"expert_collect",
+            "srairl_collect_scenarios":["merge"],"srairl_demo_episodes":3,
+            "srairl_lane_num":2},"train")
 
 
 def test_srairl_trainer_runs_one_alternating_update_end_to_end():
@@ -270,6 +323,8 @@ def test_srairl_trainer_runs_one_alternating_update_end_to_end():
         history = trainer.train()
         assert len(history) == 1
         assert "discriminator_loss" in history[0]
+        assert "preference_rank_loss" in history[0]
+        assert "preference_pairs_used" in history[0]
         assert trainer.episode == 1
         assert (Path(temp) / "training_state.pt").is_file()
         resumed = SRAIRLTrainer([env], expert, config=cfg, training_config=train_cfg)

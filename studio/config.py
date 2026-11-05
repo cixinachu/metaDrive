@@ -33,7 +33,7 @@ def clean_request(raw, kind):
     if unknown:
         raise ValueError(f'未知参数: {sorted(unknown)}')
     c = {**DEFAULTS, **raw}
-    for key, choices in [('data_source', ['procedural','highd','ngsim']), ('algorithm', ALGORITHM_NAMES), ('scenario', SCENARIOS), ('device', ['auto','cpu','cuda']),
+    for key, choices in [('data_source', ['procedural']), ('algorithm', ALGORITHM_NAMES), ('scenario', SCENARIOS), ('device', ['auto','cpu','cuda']),
                          ('view_mode', ['topdown','bird3d','chase3d','first3d']), ('reward_mode', ['cmdp','metadrive']), ('cost_mode', ['binary','continuous'])]:
         if c[key] not in choices:
             raise ValueError(f'无效 {key}')
@@ -64,18 +64,6 @@ def clean_request(raw, kind):
         raise ValueError('总训练步数必须大于预热步数，否则不会发生学习')
     if kind == 'eval' and c['episodes'] > c['num_scenarios']:
         raise ValueError('评估回合数不能超过独立场景数；避免把重复场景计为独立样本')
-    if c['data_source'] != 'procedural':
-        from datasets.importer import load_clip
-        clip, manifest = load_clip(c['dataset_id'])
-        if manifest['source'] != c['data_source']: raise ValueError('数据源与片段不匹配')
-        scenario_type = manifest.get('scenario_type', 'mainline' if manifest.get('source') == 'ngsim' and manifest.get('road_type') in (None, 'freeway', 'highway') else None)
-        if manifest.get('road_type') not in (None, 'freeway', 'highway') or (scenario_type and scenario_type != 'mainline'):
-            raise ValueError('该 NGSIM 类别尚无匹配的已验收道路网络，不能用于当前训练/评估')
-        if kind in ('train','eval') and manifest['split'] != kind:
-            raise ValueError('训练只能使用 train 片段，评估只能使用 eval 片段')
-        if kind=='eval' and c['episodes']!=1: raise ValueError('单个轨迹片段评估仅支持 1 回合；重复 seed 不构成独立样本')
-        c.update(scenario='straight',lane_num=clip['lane_num'],traffic_density=0.,num_scenarios=1,
-                 horizon=min(c['horizon'],int(math.floor(clip['duration']/.1+1e-6))))
     environment_config(c, kind)
     return c
 
@@ -95,7 +83,6 @@ def _srairl_interaction_template(raw,lane_num):
 
 def clean_srairl_request(raw, kind):
     """Validate the isolated SR-AIRL Studio interface."""
-    from datasets.importer import load_clip
     if kind not in ('train','eval'):
         raise ValueError('SR-AIRL Studio currently supports training and evaluation, not MetaDrive preview')
     operation=raw.get('srairl_operation','interaction')
@@ -106,92 +93,77 @@ def clean_srairl_request(raw, kind):
         scenario_type=raw.get('srairl_scenario','straight');lane_num=raw.get('srairl_lane_num',3)
         density=raw.get('srairl_traffic_density',.15);horizon=raw.get('srairl_horizon',1000)
         episodes=raw.get('srairl_demo_episodes',10);seed=raw.get('srairl_seed',0)
-        if scenario_type not in ('straight','curve'):raise ValueError('MetaDrive 专家示范目前只支持直道和弯道换道')
+        scenario_types=raw.get('srairl_collect_scenarios') or [scenario_type]
+        if not isinstance(scenario_types,(list,tuple)) or not scenario_types or any(name not in ('straight','curve','merge') for name in scenario_types):raise ValueError('MetaDrive 专家示范支持直道、弯道和匝道汇入，可单独或批量选择')
+        scenario_types=list(dict.fromkeys(scenario_types))
         if isinstance(lane_num,bool) or not isinstance(lane_num,int) or not 2<=lane_num<=4:raise ValueError('车道数须为 2–4')
+        if 'merge' in scenario_types and lane_num<3:raise ValueError('匝道汇入示范至少需要三条主路车道')
         if isinstance(density,bool) or not isinstance(density,(int,float)) or not math.isfinite(density) or not 0<=density<=1:raise ValueError('交通密度须在 [0, 1]')
-        if isinstance(horizon,bool) or not isinstance(horizon,int) or not 50<=horizon<=100000:raise ValueError('每回合步数须在 [50, 100000]')
-        if isinstance(episodes,bool) or not isinstance(episodes,int) or not 1<=episodes<=10000:raise ValueError('示范回合数须在 [1, 10000]')
+        if isinstance(horizon,bool) or not isinstance(horizon,int) or not 200<=horizon<=100000:raise ValueError('示范回合步数须在 [200, 100000]，以容纳换道及后续轨迹')
+        if isinstance(episodes,bool) or not isinstance(episodes,int) or not 3<=episodes<=10000:raise ValueError('每个场景至少采集 3 个 episode，才能按 episode 划分训练、验证和测试集')
         if isinstance(seed,bool) or not isinstance(seed,int) or not 0<=seed<2**32:raise ValueError('随机种子超出范围')
         view_mode=raw.get('srairl_view','topdown')
         if view_mode not in ('topdown','chase3d','first3d','bird3d'):raise ValueError('MetaDrive 画面视角无效')
         from dataclasses import asdict
-        interaction=asdict(_srairl_interaction_template(raw,lane_num))
+        base_interaction=asdict(_srairl_interaction_template(raw,lane_num))
+        interaction_scenarios={}
+        for current_scenario in scenario_types:
+            interaction=dict(base_interaction)
+            if current_scenario in ('curve','merge'):
+            # Start at a map-specific feasible speed because native curve and
+            # ramp curvature exceed the calibrated action envelope at highway speed.
+                for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
+                    interaction[key]=min(float(interaction[key]),6.)
+            interaction_scenarios[current_scenario]=interaction
         return {'task':'srairl','operation':operation,'scene_source':'procedural','scenario':scenario_type,
+            'scenarios':scenario_types,'interaction_scenarios':interaction_scenarios,
             'lane_num':lane_num,'traffic_density':float(density),'horizon':horizon,'demo_episodes':episodes,
             'seed':seed,'scene_seed':seed,'traffic_seed':(seed+1_000_003)%(2**32),'rl_seed':seed,
             'device':'cpu','srairl_view':view_mode,'dynamics_mode':'metadrive_physics',
-            'interaction_scenario':interaction,'expert_controller':'gap_acceptance_headway_v2'}
-    scene_source=raw.get('srairl_scene_source','ngsim')
-    if scene_source not in ('ngsim','procedural'):
-        raise ValueError('SR-AIRL 场景来源只能为 NGSIM 或 MetaDrive 程序化道路')
+            'interaction_scenario':base_interaction,'expert_controller':'gap_acceptance_headway_v2'}
+    scene_source=raw.get('srairl_scene_source','procedural')
+    if scene_source!='procedural':
+        raise ValueError('当前 SR-AIRL 实验只使用 MetaDrive 生成的道路和车辆')
     scenarios=raw.get('srairl_scenarios',[])
-    expert_dataset_id=str(raw.get('srairl_expert_dataset_id','')).strip()
+    expert_dataset_id=raw.get('srairl_expert_dataset_id',[])
+    expert_dataset_id=[str(item).strip() for item in expert_dataset_id] if isinstance(expert_dataset_id,(list,tuple)) else [str(expert_dataset_id).strip()] if str(expert_dataset_id).strip() else []
     if expert_dataset_id:
         expert_root=(ROOT/'datasets'/'srairl'/'metadrive').resolve()
-        expert_path=(ROOT/expert_dataset_id).resolve()
-        if kind!='train' or expert_path.parent!=expert_root or not expert_path.is_file() or expert_path.suffix!='.npz':
+        expert_paths=[(ROOT/item).resolve() for item in expert_dataset_id]
+        if kind!='train' or any(path.parent!=expert_root or not path.is_file() or path.suffix!='.npz' for path in expert_paths):
             raise ValueError('所选 MetaDrive 专家示范数据集无效')
         from datasets.srairl.expert_builder import load_transitions
         from rl.srairl.config import SRAIRLConfig
-        expert_transitions,expert_metadata=load_transitions(expert_path)
+        expert_transitions=[];expert_metadata=[]
+        for path in expert_paths:
+            transitions,metadata=load_transitions(path)
+            expert_transitions.extend(transitions);expert_metadata.append(metadata)
+        from datasets.srairl.native_windows import native_dataset_info
+        native_dataset_info(expert_paths)
+        training_scenarios=sorted({str(name) for row in expert_metadata
+            for name in (row.get('scenarios') or [row.get('scenario')]) if name in ('straight','curve','merge')})
+        if not training_scenarios:
+            raise ValueError('MetaDrive expert dataset metadata does not identify Straight, Curve, or Merge')
         config_dim=16*SRAIRLConfig.from_mapping().history_len
         if any(item.state.shape!=(config_dim,) or item.action.shape!=(2,) for item in expert_transitions):
             raise ValueError('MetaDrive 专家示范的状态/动作维度与当前 SR-AIRL 模型不匹配')
     else:
         expert_metadata=None
+        training_scenarios=[]
+    if kind=='train' and operation=='interaction' and not expert_dataset_id:
+        raise ValueError('请先选择通过质量验收的 MetaDrive 专家示范数据集')
     initialization_protocol=raw.get('srairl_initialization','canonical')
-    if initialization_protocol not in ('canonical','ngsim_distribution'):
-        raise ValueError('SR-AIRL initial-state protocol must be canonical or ngsim_distribution')
-    if initialization_protocol=='ngsim_distribution' and (scene_source!='procedural' or operation=='expert_collect'):
-        raise ValueError('NGSIM initial-state distribution applies only to procedural SR-AIRL interaction runs')
-    if initialization_protocol=='ngsim_distribution' and raw.get('srairl_scenario','straight')=='merge':
-        raise ValueError('NGSIM mainline samples cannot initialize the MetaDrive ramp-merge map')
+    if initialization_protocol!='canonical':
+        raise ValueError('SR-AIRL 初始状态只使用 MetaDrive 场景内的标准化初始布局')
     needs_experts=kind=='train' and not expert_dataset_id
-    needs_ngsim_scene=scene_source=='ngsim' or initialization_protocol=='ngsim_distribution'
-    if needs_experts or (needs_ngsim_scene and (not expert_dataset_id or initialization_protocol=='ngsim_distribution')):
-        if not isinstance(scenarios,list) or not scenarios:
-            raise ValueError('请选择 NGSIM 片段并明确指定四个车辆角色；训练时该片段提供专家示范')
-    else:
-        scenarios=[]
-    if kind=='eval' and needs_ngsim_scene and len(scenarios)!=1:
-        raise ValueError('一次 SR-AIRL NGSIM/分布评估对应一个独立轨迹片段')
+    if scenarios:
+        raise ValueError('当前 SR-AIRL 场景由 MetaDrive 程序化生成，不接受轨迹回放片段')
     checked=[]
-    role_keys=('elcv_id','rfv_id','rlv_current_id','rlv_target_id')
-    for item in scenarios:
-        if not isinstance(item,dict) or not isinstance(item.get('roles'),dict):
-            raise ValueError('SR-AIRL 场景必须包含 dataset_id 和 roles')
-        clip,manifest=load_clip(item.get('dataset_id'))
-        required_split='train' if kind=='train' else 'eval'
-        if manifest.get('source')!='ngsim' or manifest.get('split')!=required_split:
-            raise ValueError(f'SR-AIRL {kind} 只能使用 NGSIM {required_split} 数据片段')
-        roles={key:str(item['roles'].get(key,'')).strip() for key in role_keys}
-        if any(not value for value in roles.values()):raise ValueError('ELCV、RFV、当前车道前车和目标车道前车 ID 均须明确填写')
-        available={str(track['id']) for track in clip.get('tracks',[])}
-        tracks_by_id={str(track['id']):track for track in clip.get('tracks',[])}
-        missing=sorted(set(roles.values())-available)
-        if missing:raise ValueError(f'片段中找不到车辆轨迹 ID: {missing}')
-        if len(set(roles.values()))!=4:raise ValueError('四个 SR-AIRL 车辆角色必须对应不同轨迹')
-        from env.core.types import InteractionScenario
-        from env.tasks.srairl_env import SRAIRLEnv
-        interaction=InteractionScenario.from_clip(clip,manifest,**roles)
-        SRAIRLEnv(interaction,dynamics_mode='legacy_kinematic')
-        from datasets.srairl.interaction_validator import validate_interaction_scenario,extract_initial_state_distribution
-        interaction_validation=validate_interaction_scenario(interaction)
-        if not interaction_validation['valid']:
-            raise ValueError('invalid SR-AIRL NGSIM interaction clip: '+'; '.join(interaction_validation['errors']))
-        if initialization_protocol=='ngsim_distribution':
-            extract_initial_state_distribution(interaction,samples=5,window_s=2.)
-        for track_id in roles.values():
-            if float(tracks_by_id[track_id]['states'][0][0])>-.2+1e-6:
-                raise ValueError(f'SR-AIRL 轨迹 {track_id} 缺少 0.2 秒预滚动，无法复现上游差分速度/加速度')
-        if kind=='train':
-            from datasets.srairl.expert_builder import ExpertDatasetBuilder
-            transitions=ExpertDatasetBuilder().build(interaction)
-            if len(transitions)<4:raise ValueError('SR-AIRL 训练片段至少要含两个时间步的双车专家转移')
-        checked.append({'dataset_id':item['dataset_id'],'roles':roles,'manifest':manifest,
-                        'interaction_validation':interaction_validation})
     episodes=int(raw.get('srairl_episodes',1000))
     ppo_epochs=int(raw.get('srairl_ppo_epochs',80))
+    rank_lambda=raw.get('srairl_rank_lambda',.1)
+    if isinstance(rank_lambda,bool) or not isinstance(rank_lambda,(int,float)) or not math.isfinite(rank_lambda) or not 0<=rank_lambda<=10:
+        raise ValueError('SR-AIRL 偏好排序权重须在 [0, 10]')
     seed=int(raw.get('srairl_seed',0))
     scene_seed=int(raw.get('srairl_scene_seed',seed))
     traffic_seed=int(raw.get('srairl_traffic_seed',(seed+1_000_003)%(2**32)))
@@ -209,7 +181,7 @@ def clean_srairl_request(raw, kind):
     if type(meta_drive_world) is not bool:raise ValueError('MetaDrive world selection must be boolean')
     reactive_background=raw.get('srairl_reactive_background',False)
     if type(reactive_background) is not bool:raise ValueError('SR-AIRL reactive background selection must be boolean')
-    dynamics_mode=raw.get('srairl_dynamics_mode','legacy_kinematic')
+    dynamics_mode=raw.get('srairl_dynamics_mode','metadrive_physics')
     if dynamics_mode not in ('metadrive_physics','legacy_kinematic'):
         raise ValueError('SR-AIRL dynamics must be MetaDrive physics or upstream kinematics')
     if dynamics_mode=='metadrive_physics' and not meta_drive_world:
@@ -235,11 +207,16 @@ def clean_srairl_request(raw, kind):
         reactive_background=False
     from dataclasses import asdict
     interaction=asdict(_srairl_interaction_template(raw,lane_num))
+    if scenario_type in ('curve','merge'):
+        for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
+            interaction[key]=min(float(interaction[key]),6.)
     rfv_response=raw.get('srairl_rfv_response','policy')
     if rfv_response not in ('policy','fixed_speed','scripted_yield','scripted_gap_closing'):
         raise ValueError('RFV response must be policy, fixed_speed, scripted_yield or scripted_gap_closing')
     return {'srairl_scenarios':checked,'expert_dataset_id':expert_dataset_id,
             'expert_dataset_metadata':expert_metadata,'episodes':episodes,'ppo_epochs':ppo_epochs,'seed':seed,'device':device,
+            'training_scenarios':training_scenarios,
+            'rank_lambda':float(rank_lambda),
             'model_id':str(raw.get('srairl_model_id','')),'task':'srairl','dynamics_mode':dynamics_mode,
             'operation':operation,
             'metadrive_world':meta_drive_world,'srairl_view':view_mode,'srairl_reactive_background':reactive_background,
@@ -256,6 +233,7 @@ def clean_reward_guide_request(raw, kind):
     model_id = str(raw.get('srairl_model_id', '')).strip()
     if not model_id:
         raise ValueError('训练奖励引导器前，先选择已完成的 SR-AIRL 判别器模型')
+    dataset_id=_native_component_dataset(raw)
     epochs = raw.get('upstream_epochs', 1000)
     batch_size = raw.get('upstream_batch_size', 32)
     seed = raw.get('upstream_seed', 42)
@@ -273,7 +251,7 @@ def clean_reward_guide_request(raw, kind):
         import torch
         if not torch.cuda.is_available():
             raise ValueError('当前环境没有可用 CUDA 设备')
-    return {'task': 'reward_guide', 'srairl_model_id': model_id, 'epochs': epochs,
+    return {'task': 'reward_guide', 'srairl_model_id': model_id, 'dataset_id':dataset_id, 'epochs': epochs,
             'batch_size': batch_size, 'seed': seed, 'device': device}
 
 
@@ -283,6 +261,7 @@ def clean_predictor_request(raw, kind):
     model_id = str(raw.get('reward_guide_model_id', '')).strip()
     if not model_id:
         raise ValueError('训练预测器前，先选择已完成的奖励引导器模型')
+    dataset_id=_native_component_dataset(raw)
     epochs = raw.get('upstream_epochs', 1000)
     batch_size = raw.get('upstream_batch_size', 32)
     seed = raw.get('upstream_seed', 42)
@@ -300,13 +279,14 @@ def clean_predictor_request(raw, kind):
         import torch
         if not torch.cuda.is_available():
             raise ValueError('当前环境没有可用 CUDA 设备')
-    return {'task': 'predictor', 'reward_guide_model_id': model_id, 'epochs': epochs,
+    return {'task': 'predictor', 'reward_guide_model_id': model_id, 'dataset_id':dataset_id, 'epochs': epochs,
             'batch_size': batch_size, 'seed': seed, 'device': device}
 
 
 def clean_planner_request(raw, kind):
     if kind != 'train':
         raise ValueError('规划器候选生成和闭环评估接口仍在接入；当前提供完整训练链')
+    dataset_id=_native_component_dataset(raw)
     goal_epochs=raw.get('planner_goal_epochs',1000)
     dppo_steps=raw.get('planner_dppo_steps',1000)
     batch_size=raw.get('upstream_batch_size',32)
@@ -325,8 +305,22 @@ def clean_planner_request(raw, kind):
     if device=='cuda':
         import torch
         if not torch.cuda.is_available():raise ValueError('当前环境没有可用 CUDA 设备')
-    return {'task':'planner','goal_epochs':goal_epochs,'dppo_steps':dppo_steps,
+    return {'task':'planner','dataset_id':dataset_id,'goal_epochs':goal_epochs,'dppo_steps':dppo_steps,
             'batch_size':batch_size,'seed':seed,'device':device}
+
+
+def _native_component_dataset(raw):
+    value=raw.get('srairl_expert_dataset_id',[])
+    dataset_ids=[str(item).strip() for item in value] if isinstance(value,(list,tuple)) else [str(value).strip()] if str(value).strip() else []
+    root=(ROOT/'datasets'/'srairl'/'metadrive').resolve()
+    paths=[(ROOT/item).resolve() for item in dataset_ids]
+    if not paths or any(path.parent!=root or path.suffix!='.npz' or not path.is_file() for path in paths):
+        raise ValueError('请选择已采集且包含 train/validation/test 的 MetaDrive 专家示范数据集')
+    from datasets.srairl.native_windows import native_dataset_info
+    info=native_dataset_info(paths)
+    if any(info['windows_by_split'].get(name,0)<1 for name in ('train','validation','test')):
+        raise ValueError('MetaDrive 示范集的 train/validation/test 至少各需要一个完整 20+100 窗口')
+    return [str(path.relative_to(ROOT)) for path in paths]
 
 
 def clean_interaction_evaluation_request(raw):
@@ -342,8 +336,8 @@ def clean_interaction_evaluation_request(raw):
     replan_steps = raw.get('pipeline_replan_steps', 5)
     if scenario not in ('straight', 'curve', 'merge'):
         raise ValueError('综合评估场景只能是直道、弯道或匝道汇入')
-    if initialization not in ('canonical', 'ngsim_distribution'):
-        raise ValueError('初始状态只能使用典型状态或 NGSIM 分布')
+    if initialization != 'canonical':
+        raise ValueError('MetaDrive 综合评估只使用场景内的标准化初始布局')
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed < 2**32:
         raise ValueError('pipeline_seed must be an integer in [0, 2^32)')
     if isinstance(episodes, bool) or not isinstance(episodes, int) or not 1 <= episodes <= 1000:
@@ -352,8 +346,6 @@ def clean_interaction_evaluation_request(raw):
         raise ValueError('Planner 候选数必须在 [1,64]')
     if isinstance(replan_steps, bool) or not isinstance(replan_steps, int) or not 1 <= replan_steps <= 20:
         raise ValueError('重规划步数必须在 [1,20]')
-    if initialization == 'ngsim_distribution' and scenario == 'merge':
-        raise ValueError('当前 NGSIM 初始分布只用于直道或弯道 MetaDrive 场景')
     raw_srairl = dict(raw)
     raw_srairl.update(srairl_operation='interaction', srairl_scene_source='procedural',
         srairl_dynamics_mode='metadrive_physics', srairl_initialization=initialization,

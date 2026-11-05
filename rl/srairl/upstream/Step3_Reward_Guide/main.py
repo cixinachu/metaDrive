@@ -53,7 +53,8 @@ def eval(args, loader, trainer, model, fv_reward):
         dolv = n_olv - n_lcv
 
         state = torch.from_numpy(np.concatenate([n_lcv, dfv, dnlv, dolv], axis=-1)).to(device).float()
-        true_reward = fv_reward(state)
+        history_state = batch[4].to(device).float() if len(batch)>4 else None
+        true_reward = fv_reward(state, history_state)
 
         # Noisy data
         noisy_fv, t = trainer(torch.from_numpy(n_fv).to(device))
@@ -130,10 +131,17 @@ def train(args):
         return 1
 
     _disc_hist_len = _infer_hist_len(disc)
-    def _stack_history_states(states, hist_len):
+    def _stack_history_states(states, hist_len, observed_history=None):
         """
         将 (B, T, 16) 叠成 (B, T, 16*hist_len)，前几帧用第 0 帧填充，保持与判别器训练时一致。
         """
+        if observed_history is not None:
+            observed_history=observed_history.to(states.device,dtype=states.dtype)
+            if observed_history.ndim!=3 or observed_history.shape[0]!=states.shape[0] or observed_history.shape[-1]!=16 or observed_history.shape[1]<hist_len-1:
+                raise ValueError('Reward Guide requires aligned real 11-frame MetaDrive history')
+            combined=torch.cat([observed_history[:,-(hist_len-1):],states],dim=1)
+            return torch.stack([combined[:,i:i+hist_len].reshape(states.shape[0],-1)
+                                for i in range(states.shape[1])],dim=1)
         if hist_len <= 1:
             return states
         bsz, seq_len, feat = states.shape
@@ -146,7 +154,7 @@ def train(args):
             stacked.append(torch.cat(history, dim=-1))
         return torch.stack(stacked, dim=1)  # (B, T, hist_len*feat)
 
-    def fv_reward(state):
+    def fv_reward(state, observed_history=None):
         """
         state: (B, T, 16) -> 输出 (B, T, 1)
         兼容两类判别器：
@@ -154,7 +162,7 @@ def train(args):
           - AIRLDiscrim：仅使用 g (私有奖励)
         """
         batch_size, seq_len = state.shape[:2]
-        state_hist = _stack_history_states(state, _disc_hist_len)
+        state_hist = _stack_history_states(state, _disc_hist_len, observed_history)
         flat = state_hist.reshape(-1, state_hist.shape[-1])
         if hasattr(disc, "get_reward"):
             r_total, _, _ = disc.get_reward(flat)
@@ -203,7 +211,8 @@ def train(args):
 
             clean_state = torch.from_numpy(np.concatenate([n_lcv, dfv, dnlv, dolv], axis=-1)).to(device).float()
             with torch.no_grad():
-                true_reward = fv_reward(clean_state)
+                history_state = batch[4].to(device).float() if len(batch)>4 else None
+                true_reward = fv_reward(clean_state, history_state)
 
             # Noisy data
             noisy_fv, t = trainer(torch.from_numpy(n_fv).to(device))
@@ -240,7 +249,7 @@ def train(args):
                     'state_dict': model.state_dict(),
                     'architecture': {'context_dim': args.context_dim, 'T': args.T},
                     'metadata': {'obs_len': args.obs_len, 'pred_len': args.pred_len,
-                                 'dt': 0.1, 'state_dim': 16, 'history_len': 4,
+                                 'dt': 0.1, 'state_dim': 16, 'history_len': 11,
                                  'normalization_version': 'reward-predictor-v1',
                                  'dataset_revision': hashlib.sha256(Path(args.data_path).read_bytes()).hexdigest()},
                 }, results_dir / 'best_model.pth')
@@ -317,7 +326,7 @@ if __name__ == "__main__":
     parser.add_argument('--ema_decay', type=float, default=0.999)
     parser.add_argument('--sample_step', type=int, default=10)
     parser.add_argument('--print_step', type=int, default=5)
-    parser.add_argument('--data_path', type=str, default=str(root_dir / 'rl/srairl/upstream/data/sample_data.pkl'))
+    parser.add_argument('--data_path', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='')
     parser.add_argument('--srairl_model', type=str, default='')
     parser.add_argument('--discriminator_path', type=str, default='')

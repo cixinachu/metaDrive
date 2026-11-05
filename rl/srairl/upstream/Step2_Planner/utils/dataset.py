@@ -40,6 +40,26 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.use_padding = use_padding
         self.max_path_length = 151
 
+        if str(data_path).endswith('.npz'):
+            from datasets.srairl.native_windows import load_native_windows
+            split = 'validation' if if_test else 'train'
+            windows = load_native_windows(data_path, split=split)
+            self.native = True
+            self.record_trajectory = []
+            self.record_path_length = []
+            self.native_actions = []
+            for window in windows:
+                # Planner predicts ELCV future [a_x,a_y,y,x,v_x,v_y].
+                obs = window.future[:, 0, :4]
+                action = window.actions[:, 0, :]
+                self.record_trajectory.append(np.concatenate((obs, np.zeros((len(obs), 3))), axis=-1))
+                self.record_path_length.append(len(obs))
+                self.native_actions.append(action)
+            self.indices = [(i, 0, self.horizon) for i, n in enumerate(self.record_path_length) if n >= self.horizon]
+            self.observation_dim, self.action_dim = 4, 2
+            self.if_test = bool(if_test)
+            return
+        self.native = False
         with open(data_path, "rb") as input_file:
             data = pickle.load(input_file)
 
@@ -107,6 +127,12 @@ class SequenceDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx, eps=1e-4):
         path_ind, start, end = self.indices[idx]
+
+        if self.native:
+            observations = self.record_trajectory[path_ind][start:end, :4]
+            actions = self.native_actions[path_ind][start:end]
+            trajectories = np.concatenate([actions, observations], axis=-1)
+            return Batch(trajectories.astype(np.float32), self.get_conditions(observations))
 
         observations = self.record_trajectory[path_ind][['y', 'x', 'v_x', 'v_y']].iloc[start:end].values
         actions = self.record_trajectory[path_ind][['a_x', 'a_y']].iloc[start:end].values

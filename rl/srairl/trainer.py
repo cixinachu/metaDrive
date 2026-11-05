@@ -18,10 +18,30 @@ from rl.srairl.ppo import PPO
 from env.tasks.srairl_env import SRAIRLEnv
 
 
+def counterfactual_preference_mask(states, config, *, gap_reduction_m=5.0):
+    """Select expert states whose gap-reduced counterpart violates safety screens."""
+    frames=states.reshape(-1,config.history_len,config.frame_state_dim)
+    latest=frames[:,-1]
+    gap_m=latest[:,5]*config.pos_long_scale
+    closing_mps=(-latest[:,6]*config.vel_scale).clamp_min(0.)
+    rfv_speed_mps=(latest[:,2]*config.vel_scale+config.vel_offset-
+                   latest[:,6]*config.vel_scale).clamp_min(.1)
+    cf_gap=(gap_m-float(gap_reduction_m)).clamp_min(0.)
+    expert_ttc=torch.where(closing_mps>1e-3,(gap_m-4.5).clamp_min(0.)/closing_mps,
+                           torch.full_like(gap_m,float('inf')))
+    cf_ttc=torch.where(closing_mps>1e-3,(cf_gap-4.5).clamp_min(0.)/closing_mps,
+                       torch.full_like(gap_m,float('inf')))
+    expert_unsafe=(gap_m<=5.)|(expert_ttc<=1.5)|(gap_m/rfv_speed_mps<=.5)
+    counterfactual_unsafe=(cf_gap<=5.)|(cf_ttc<=1.5)|(cf_gap/rfv_speed_mps<=.5)
+    counterfactual=frames.clone()
+    counterfactual[:,:,5]=(counterfactual[:,:,5]-float(gap_reduction_m)/config.pos_long_scale).clamp_min(-1.)
+    return counterfactual.reshape_as(states),counterfactual_unsafe & ~expert_unsafe
+
+
 @dataclass(frozen=True)
 class SRAIRLTrainingConfig:
     episodes: int = 110001
-    action_scale: float = 5.0
+    action_scale: float = 1.5
     actor_lr: float = 3e-4
     critic_lr: float = 1e-3
     discriminator_lr: float = 3e-4
@@ -36,6 +56,8 @@ class SRAIRLTrainingConfig:
     discriminator_updates: int = 10
     lambda_social: float = 0.0
     lambda_equilibrium: float = 0.01
+    lambda_rank: float = 0.1
+    preference_margin: float = 0.01
     seed: int = 0
     device: str = "auto"
 
@@ -48,6 +70,8 @@ class SRAIRLTrainingConfig:
             raise ValueError("device must be auto, cpu or cuda")
         if self.device == "cuda" and not torch.cuda.is_available():
             raise ValueError("CUDA was requested but is unavailable")
+        if self.lambda_rank < 0 or self.preference_margin < 0:
+            raise ValueError("preference-ranking weight and margin must be nonnegative")
 
 
 class ExpertTransitions:
@@ -75,14 +99,21 @@ class ExpertTransitions:
 
 
 class SRAIRLTrainer:
-    def __init__(self, envs, expert_transitions, config=None, training_config=None, output_dir=None):
-        if not envs:
-            raise ValueError("at least one SRAIRLEnv is required")
-        self.envs = list(envs)
+    def __init__(self, envs, expert_transitions, config=None, training_config=None, output_dir=None,
+                 env_factory=None, environment_count=1, dynamics_mode=None):
+        self.envs = list(envs or [])
+        if env_factory is None and not self.envs:
+            raise ValueError("at least one SRAIRLEnv or an environment factory is required")
+        if env_factory is not None and self.envs:
+            raise ValueError("provide reusable environments or an environment factory, not both")
         if any(not isinstance(env, SRAIRLEnv) for env in self.envs):
             raise TypeError("SR-AIRL trainer accepts only the two-actor SRAIRLEnv")
         if any(env.dynamics_modes and env.observer.history_len != (config or SRAIRLConfig.from_mapping()).history_len for env in self.envs):
             raise ValueError("all interaction environments must use configured history length")
+        self.env_factory=env_factory
+        self.environment_count=max(1,int(environment_count)) if env_factory is not None else len(self.envs)
+        self.dynamics_mode=dynamics_mode or (self.envs[0].dynamics_mode if self.envs else "metadrive_physics")
+        self.last_env=self.envs[0] if self.envs else None
         self.config = config or SRAIRLConfig.from_mapping()
         self.train_config = training_config or SRAIRLTrainingConfig()
         if self.train_config.device == "auto":
@@ -152,7 +183,8 @@ class SRAIRLTrainer:
 
     def _discriminator_update(self):
         d = self.train_config
-        losses, accuracies, private_values, potentials = [], [], [], []
+        losses, accuracies, private_values, potentials, rank_losses = [], [], [], [], []
+        rank_pair_counts=[]
         self.policy_elcv.policy.eval(); self.policy_rfv.policy.eval()
         for _ in range(d.discriminator_updates):
             gen_e = self.policy_elcv.buffer.sample(d.discriminator_batch_size)
@@ -171,7 +203,7 @@ class SRAIRLTrainer:
             p_gen_f, p_exp_f = p_gen_f.clamp(.05,.95), p_exp_f.clamp(.05,.95)
             loss = self.bce(p_exp_e, torch.full_like(p_exp_e,.9)) + self.bce(p_exp_f, torch.full_like(p_exp_f,.9))
             loss += self.bce(p_gen_e, torch.full_like(p_gen_e,.1)) + self.bce(p_gen_f, torch.full_like(p_gen_f,.1))
-            social = loss.new_zeros(()); equilibrium = loss.new_zeros(())
+            social = loss.new_zeros(()); equilibrium = loss.new_zeros(()); rank = loss.new_zeros(())
             if d.lambda_social > 0:
                 _, private_e, _ = self.discriminator_elcv.get_reward(exp["states"])
                 _, private_f, _ = self.discriminator_rfv.get_reward(exp["states"])
@@ -180,7 +212,21 @@ class SRAIRLTrainer:
                 adv_e = self.discriminator_elcv.f(exp["states"], exp["dones"], exp["next_states"]).clamp(-5,5)
                 adv_f = self.discriminator_rfv.f(exp["states"], exp["dones"], exp["next_states"]).clamp(-5,5)
                 equilibrium = adv_e.square().mean() + adv_f.square().mean()
-            total = loss + d.lambda_social*social + d.lambda_equilibrium*equilibrium
+            rank_pairs=0
+            if d.lambda_rank > 0:
+                cf_states,eligible=counterfactual_preference_mask(exp['states'],self.config)
+                rank_pairs=int(eligible.sum().item())
+                if rank_pairs:
+                    expert_e=self.discriminator_elcv.get_reward(exp['states'])[0]
+                    cf_e=self.discriminator_elcv.get_reward(cf_states)[0]
+                    expert_f=self.discriminator_rfv.get_reward(exp['states'])[0]
+                    cf_f=self.discriminator_rfv.get_reward(cf_states)[0]
+                    rank_e=nn.functional.softplus(self.train_config.preference_margin-(expert_e-cf_e)).reshape(-1)
+                    rank_f=nn.functional.softplus(self.train_config.preference_margin-(expert_f-cf_f)).reshape(-1)
+                    rank=(rank_e[eligible].mean()+rank_f[eligible].mean())
+                rank_losses.append(float(rank.detach().cpu()))
+                rank_pair_counts.append(rank_pairs)
+            total = loss + d.lambda_social*social + d.lambda_equilibrium*equilibrium + d.lambda_rank*rank
             self.discriminator_optimizer.zero_grad(); total.backward(); self.discriminator_optimizer.step()
             losses.append(float(total.detach().cpu()))
             accuracies.append((float((p_exp_e>.5).float().mean()), float((p_gen_e<.5).float().mean()),
@@ -203,6 +249,8 @@ class SRAIRLTrainer:
                 "expert_accuracy_rfv": float(np.mean([a[2] for a in accuracies])),
                 "policy_accuracy_rfv": float(np.mean([a[3] for a in accuracies])),
                 "private_reward": float(np.mean(private_values)), "shared_potential": float(np.mean(potentials)),
+                "preference_rank_loss": float(np.mean(rank_losses)) if rank_losses else 0.0,
+                "preference_pairs_used": float(np.mean(rank_pair_counts)) if rank_pair_counts else 0.0,
                 "alpha_elcv": float(self.discriminator_elcv.alpha.detach().cpu()),
                 "alpha_rfv": float(self.discriminator_rfv.alpha.detach().cpu())}
 
@@ -228,10 +276,11 @@ class SRAIRLTrainer:
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
             "seed": self.train_config.seed,
         }, directory / "training_state.pt")
-        (directory / "config.json").write_text(json.dumps({"algorithm": "SR-AIRL", "srairl": self.config.__dict__,
+        (directory / "config.json").write_text(json.dumps({"algorithm": "SR-AIRL", "reward_version":"temporal-dynamic-v2",
+            "srairl": self.config.__dict__,
             "training": self.train_config.__dict__, "episode": self.episode, "global_steps": self.global_steps,
-            "dynamics_mode":self.envs[0].dynamics_mode,
-            "reactive_background":bool(getattr(getattr(getattr(self.envs[0].world,"engine",None),"traffic_manager",None),"reactive",False))}, indent=2))
+            "dynamics_mode":self.dynamics_mode,
+            "reactive_background":bool(getattr(getattr(getattr(self.envs[0].world,"engine",None),"traffic_manager",None),"reactive",False)) if self.envs else False}, indent=2))
 
     def load_training_state(self, directory):
         """Resume a trusted local checkpoint at an episode boundary."""
@@ -242,7 +291,7 @@ class SRAIRLTrainer:
         if metadata.get("training") != self.train_config.__dict__:
             raise ValueError("checkpoint training configuration does not match the current run")
         dynamics = metadata.get("dynamics_mode")
-        if dynamics != self.envs[0].dynamics_mode:
+        if dynamics != self.dynamics_mode:
             raise ValueError("checkpoint dynamics mode does not match the current environment")
         self.policy_elcv.load(directory / "policy_elcv.pt")
         self.policy_rfv.load(directory / "policy_rfv.pt")
@@ -283,8 +332,21 @@ class SRAIRLTrainer:
     def train(self, callback=None):
         history = []
         for episode in range(self.episode, self.train_config.episodes):
-            env=self.envs[episode % len(self.envs)]
-            tracking_return = self._collect_episode(env)
+            if self.env_factory is None:
+                env=self.envs[episode % len(self.envs)]
+                tracking_return = self._collect_episode(env)
+            else:
+                env=self.env_factory(episode)
+                if not isinstance(env,SRAIRLEnv):
+                    raise TypeError("SR-AIRL environment factory must return an SRAIRLEnv")
+                if env.dynamics_mode!=self.dynamics_mode:
+                    env.close()
+                    raise ValueError("SR-AIRL environment factory returned a different dynamics mode")
+                self.last_env=env
+                try:
+                    tracking_return = self._collect_episode(env)
+                finally:
+                    env.close()
             metrics = {"episode": episode, "global_steps": self.global_steps, "tracking_return": tracking_return}
             sample=getattr(env,'current_initial_state',None)
             if sample:

@@ -12,10 +12,10 @@ class TaskDescriptor:
 
 TASK_REGISTRY = {
     "safe_rl": TaskDescriptor("safe_rl", "Safe RL", "available", "Single-ego CMDP; select an algorithm from rl.algorithms.REGISTRY."),
-    "srairl": TaskDescriptor("srairl", "SR-AIRL", "available", "Two learned policy actors (ELCV/RFV) can train from explicitly assigned NGSIM demonstrations and run either on NGSIM replay or generated MetaDrive straight/curve/merge maps with multiple IDM traffic vehicles. Background traffic is not an additional learned SR-AIRL policy; procedural-map training uses NGSIM as the expert transition source."),
-    "reward_guide": TaskDescriptor("reward_guide", "SR-AIRL Reward Guide", "available", "Upstream diffusion reward-guide training initialized from a selected local SR-AIRL discriminator. The pinned NGSIM pair subset has 203 records: 150 training and 53 used for checkpoint selection; it has no independent test split."),
-    "predictor": TaskDescriptor("predictor", "SR-AIRL Response Predictor", "available", "Upstream response-predictor diffusion training initialized from a selected reward-guide checkpoint. It uses the same 150/53 pinned NGSIM pair split; the 53 records select checkpoints and are not an independent test set."),
-    "planner": TaskDescriptor("planner", "Diffusion Planner", "available", "Upstream goal predictor and DPPO diffusion planner train sequentially on the pinned NGSIM pair subset: 150 training and 53 checkpoint-selection records, with no independent test split."),
+    "srairl": TaskDescriptor("srairl", "SR-AIRL", "available", "Two learned policy actors (ELCV/RFV) train from accepted MetaDrive expert demonstrations and interact in MetaDrive-generated straight, curve and ramp-merge scenes with optional IDM traffic."),
+    "reward_guide": TaskDescriptor("reward_guide", "SR-AIRL Reward Guide", "available", "Upstream diffusion reward-guide training uses the selected episode-grouped MetaDrive expert dataset and a compatible local SR-AIRL discriminator."),
+    "predictor": TaskDescriptor("predictor", "SR-AIRL Response Predictor", "available", "Upstream response-predictor diffusion training uses the selected episode-grouped MetaDrive expert dataset and a compatible reward-guide checkpoint."),
+    "planner": TaskDescriptor("planner", "Diffusion Planner", "available", "Goal predictor and DPPO diffusion planner train sequentially on the selected episode-grouped MetaDrive expert dataset."),
     "evaluation": TaskDescriptor("evaluation", "Interaction Evaluation", "partial", "A versioned CandidateBundle, Planner/Reward-Guided Predictor inference, SR-AIRL reward selector, dual Tracker, calibrated-domain filter and 0.5-second receding-horizon MetaDrive task are implemented. It remains partial until compatible trained component checkpoints exist and full episodes pass on straight, curve and merge maps."),
 }
 

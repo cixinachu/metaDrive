@@ -139,7 +139,12 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
                  interaction_scenario=None):
         from env.tasks.srairl_interaction import SRAIRLInteractionScenario
         from metadrive.component.pgblock.first_block import FirstPGBlock
-        map_code={"straight":"S", "curve":"C", "merge":"r"}.get(scenario_type)
+        # The stock single-block presets end shortly after the interaction
+        # zone. Use MetaDrive's native block sequences to leave enough real
+        # road for the required post-manoeuvre trajectory horizon.
+        # Keep enough generated road after the interaction zone for the full
+        # 20-frame warm-up plus a 100-step future demonstration window.
+        map_code={"straight":"S"*12, "curve":"C"*12, "merge":"r"+"S"*12}.get(scenario_type)
         if map_code is None:
             raise ValueError(f"SR-AIRL interaction map is not validated: {scenario_type}")
         if lane_num < 2:
@@ -159,10 +164,10 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
             # lane in its navigation route.
             agent_configs={
                 "agent0":dict(spawn_lane_index=("1r1_2_","1r1_3_",0),spawn_longitude=4.,
-                           spawn_velocity=(20.,0.),spawn_velocity_car_frame=True,
+                           spawn_velocity=(self.interaction_scenario.elcv_speed,0.),spawn_velocity_car_frame=True,
                            max_speed_km_h=130,use_special_color=True,show_navi_mark=False,show_dest_mark=False),
                 "agent1":dict(spawn_lane_index=(">>>","1r0_0_",2),spawn_longitude=25.,
-                           spawn_velocity=(18.,0.),spawn_velocity_car_frame=True,
+                           spawn_velocity=(self.interaction_scenario.rfv_speed,0.),spawn_velocity_car_frame=True,
                            max_speed_km_h=130,use_special_color=True,show_navi_mark=False,show_dest_mark=False),
             }
         else:
@@ -182,7 +187,7 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
             "random_agent_model":False,"allow_respawn":False,"delay_done":0,
             "crash_done":False,"out_of_road_done":False,
             "traffic_density":float(traffic_density),"random_traffic":False,
-            "map":map_code,"map_config":{"lane_num":int(lane_num),"lane_width":3.5,"exit_length":500.},
+            "map":map_code,"map_config":{"lane_num":int(lane_num),"lane_width":3.5,"exit_length":50.},
             # The wrapper terminates its own rollout one step before MetaDrive
             # truncation so both controlled agents remain available for the
             # final observation and collision accounting.
@@ -262,30 +267,59 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         ego_lane=lanes[spec.source_lane]
         ego_s,_=ego_lane.local_coordinates(self.role_vehicle('elcv').position[:2])
         self._interaction_s_offset=float(ego_s)-spec.elcv_x
+        self._interaction_lane_paths={}
+        self._interaction_lane_paths[spec.source_lane]=self._lane_path(ego_lane)
+        self._interaction_lane_paths[spec.target_lane]=self._lane_path(lanes[spec.target_lane])
         for role,lane_index,x,speed in (
             ('rlv_current',spec.source_lane,spec.rlv_current_x,spec.rlv_current_speed),
             ('rlv_target',spec.target_lane,spec.rlv_target_x,spec.rlv_target_speed)):
-            lane=lanes[lane_index];position=lane.position(float(x+self._interaction_s_offset),0.)
+            path=self._interaction_lane_paths[lane_index]
+            lane,local=self._path_position(path,float(x+self._interaction_s_offset));position=lane.position(local,0.)
             vehicle=self.engine.spawn_object(ReplayVehicle,vehicle_config=dict(length=4.5,width=1.8,height=1.5,
-                spawn_position_heading=((float(position[0]),float(position[1])),float(lane.heading_theta_at(float(x+self._interaction_s_offset)))),
+                spawn_position_heading=((float(position[0]),float(position[1])),float(lane.heading_theta_at(local))),
                 navigation_module=None,enable_reverse=False,show_navi_mark=False,show_dest_mark=False))
             vehicle.body.setKinematic(True);heading=float(lane.heading_theta_at(float(x+self._interaction_s_offset)))
             vehicle.recorded_velocity=np.asarray([speed*np.cos(heading),speed*np.sin(heading)])
             vehicle.set_velocity(vehicle.recorded_velocity);self.interaction_vehicles[role]=vehicle
         return self.interaction_vehicles
 
+    def _lane_path(self,start_lane,max_edges=64):
+        """Follow a generated map's forward road graph in the same lane index."""
+        graph=self.current_map.road_network.graph;path=[start_lane];visited={tuple(start_lane.index)}
+        lane_index=int(start_lane.index[-1])
+        for _ in range(max_edges-1):
+            node=path[-1].index[1];outgoing=graph.get(node,{})
+            choices=[]
+            for next_node,lanes in outgoing.items():
+                if not lanes:continue
+                lane=lanes[min(lane_index,len(lanes)-1)]
+                key=tuple(lane.index)
+                if key in visited:continue
+                current=path[-1];s=max(0.,current.length-.1)
+                h0=float(current.heading_theta_at(s));h1=float(lane.heading_theta_at(.1))
+                alignment=float(np.cos(h1-h0))
+                if alignment>.25:choices.append((alignment,lane))
+            if not choices:break
+            lane=max(choices,key=lambda item:item[0])[1]
+            path.append(lane);visited.add(tuple(lane.index))
+        return path
+
     def _spawn_merge_roles(self,ReplayVehicle,vehicle_class_to_type,vehicle_type):
         """Place explicit ramp and mainline leaders on MetaDrive's connected ramp graph."""
         vehicle_class_to_type[ReplayVehicle]='dataset_replay';vehicle_type['dataset_replay']=ReplayVehicle
         graph=self.current_map.road_network.graph
         self.interaction_vehicles={};self._interaction_elapsed=0.;self._interaction_paths={}
-        ramp=[graph['1r1_3_']['1r0_0_'][0],graph['1r0_0_']['1r0_1_'][3]]
-        mainline=[graph['>>>']['1r0_0_'][2],graph['1r0_0_']['1r0_1_'][2],graph['1r0_1_']['1r0_2_'][2]]
-        # The current-lane leader stays on the ramp/auxiliary branch. The
-        # target-lane leader and RFV share the mainline lane reached by ELCV.
+        ego=self.role_vehicle('elcv')
+        ramp=self._lane_path(ego.lane)
+        ego_local,_=ego.lane.local_coordinates(ego.position[:2])
+        current_leader_s=float(ego_local)+max(12.,self.interaction_scenario.rlv_current_x-
+                                                    self.interaction_scenario.elcv_x)
+        mainline=self._lane_path(graph['>>>']['1r0_0_'][2])
+        # Keep the current-lane leader on the same continuous ramp-to-mainline
+        # route as ELCV; the target-lane leader and RFV share the mainline.
         placements={
-            'rlv_current':(ramp,1.,18.),
-            'rlv_target':(mainline,60.,20.),
+            'rlv_current':(ramp,current_leader_s,self.interaction_scenario.rlv_current_speed),
+            'rlv_target':(mainline,self.interaction_scenario.rlv_target_x,self.interaction_scenario.rlv_target_speed),
         }
         for role,(path,s0,speed) in placements.items():
             lane,local=self._path_position(path,s0)
@@ -331,15 +365,14 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
                 vehicle.recorded_velocity=np.asarray([speed*np.cos(heading),speed*np.sin(heading)])
                 vehicle.set_velocity(vehicle.recorded_velocity);vehicle.after_step()
             return
-        a,b=self.role_vehicle('elcv').lane_index[:2]
-        lanes=self.current_map.road_network.graph[a][b]
         for role,lane_index,x0,speed in (
             ('rlv_current',spec.source_lane,spec.rlv_current_x,spec.rlv_current_speed),
             ('rlv_target',spec.target_lane,spec.rlv_target_x,spec.rlv_target_speed)):
-            x=x0+speed*self._interaction_elapsed;lane=lanes[lane_index];position=lane.position(x+self._interaction_s_offset,0.)
+            x=x0+speed*self._interaction_elapsed;path=self._interaction_lane_paths[lane_index]
+            lane,local=self._path_position(path,x+self._interaction_s_offset);position=lane.position(local,0.)
             vehicle=self.interaction_vehicles[role]
             vehicle.set_position((float(position[0]),float(position[1])))
-            heading=float(lane.heading_theta_at(x+self._interaction_s_offset));vehicle.set_heading_theta(heading)
+            heading=float(lane.heading_theta_at(local));vehicle.set_heading_theta(heading)
             vehicle.recorded_velocity=np.asarray([speed*np.cos(heading),speed*np.sin(heading)])
             vehicle.set_velocity(vehicle.recorded_velocity);vehicle.after_step()
 

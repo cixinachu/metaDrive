@@ -1,6 +1,6 @@
 """SR-AIRL constants supplied for the current study (SI units)."""
 FRAME_STATE_DIM = 16
-HISTORY_LEN = 4
+HISTORY_LEN = 11
 
 GAMMA = 0.99
 

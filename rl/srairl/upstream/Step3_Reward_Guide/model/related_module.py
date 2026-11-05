@@ -31,33 +31,16 @@ def trajectory_process(trajectory, decision_time):
     return trajectory
 
 
-def build_trajecotry():
-    with open('sample_data.pkl', "rb") as input_file:
-        data = pickle.load(input_file)
-
-    record_trajectory = {'lcv': [], 'fv': [], 'nlv': [], 'olv': []}
-
-    for pair in data[150:]:
-        end_frame = pair['end_frame'].values[0]
-        decision_frame = pair['decision_frame'].values[0]
-        lcv = pair[['frame', 'id_x', 'y_x', 'x_x', 'width_x', 'height_x', 'laneId_x']].iloc[20:]
-        fv = pair[['frame', 'id_y', 'y_y', 'x_y', 'width_y', 'height_y', 'laneId_y']].iloc[20:]
-        nlv = pair[['frame', 'id', 'y', 'x', 'width', 'height', 'laneId']].iloc[20:]
-        olv = pair[['frame', 'id_z', 'y_z', 'x_z', 'width_z', 'height_z', 'laneId_z']].iloc[20:]
-
-        lcv = trajectory_process(lcv, decision_frame)
-        fv = trajectory_process(fv, decision_frame)
-        nlv = trajectory_process(nlv, decision_frame)
-        olv = trajectory_process(olv, decision_frame)
-
-        if lcv.isnull().values.any() or fv.isnull().values.any() or nlv.isnull().values.any() or olv.isnull().values.any():
-            continue
-
-        record_trajectory['lcv'].append(lcv)
-        record_trajectory['fv'].append(fv)
-        record_trajectory['nlv'].append(nlv)
-        record_trajectory['olv'].append(olv)
-
+def build_trajecotry(data_path, split='validation'):
+    """Build the guide's four native MetaDrive role streams from split episodes."""
+    if not data_path or not str(data_path).endswith('.npz'):
+        raise ValueError('Reward Guide requires a native MetaDrive expert archive (.npz)')
+    from datasets.srairl.native_windows import load_native_windows
+    windows=load_native_windows(data_path,split=split)
+    record_trajectory={key:[] for key in ('lcv','fv','nlv','olv')}
+    for window in windows:
+        for index,key in enumerate(record_trajectory):
+            record_trajectory[key].append(window.future[:,index,:4])
     return record_trajectory
 
 

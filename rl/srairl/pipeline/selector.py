@@ -70,7 +70,7 @@ class CandidateSelector:
     @staticmethod
     def _reward(discriminator, state, history_states=None):
         device = next(discriminator.parameters()).device
-        history_len = int(getattr(discriminator, "history_len", 4))
+        history_len = int(getattr(discriminator, "history_len", 11))
         stacked = CandidateSelector._history_stack(state, history_len, history_states)
         with torch.no_grad():
             tensor = torch.as_tensor(stacked, dtype=torch.float32, device=device)

@@ -241,7 +241,7 @@ def train(args):
                     'state_dict': ema_model.state_dict(),
                     'architecture': {'context_dim': args.context_dim, 'T': args.T},
                     'metadata': {'obs_len': args.obs_len, 'pred_len': args.pred_len,
-                                 'dt': 0.1, 'state_dim': 16, 'history_len': 4,
+                                 'dt': 0.1, 'state_dim': 16, 'history_len': 11,
                                  'normalization_version': 'reward-predictor-v1',
                                  'dataset_revision': hashlib.sha256(Path(args.data_path).read_bytes()).hexdigest()},
                 }, results_dir / 'best_model.pth')
@@ -314,7 +314,7 @@ if __name__ == "__main__":
     parser.add_argument('--ema_decay', type=float, default=0.999)
     parser.add_argument('--sample_step', type=int, default=10)
     parser.add_argument('--print_step', type=int, default=5)
-    parser.add_argument('--data_path', type=str, default=str(root_dir / 'rl/srairl/upstream/data/sample_data.pkl'))
+    parser.add_argument('--data_path', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='')
     parser.add_argument('--reward_guide_path', type=str, default='')
     parser.add_argument('--studio_dir', type=str, default='')

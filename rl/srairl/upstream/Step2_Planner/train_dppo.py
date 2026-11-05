@@ -127,7 +127,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed',type=int,default=42)
     args=parser.parse_args()
     torch.manual_seed(args.seed);np.random.seed(args.seed)
-    if not args.data_path:args.data_path=str(Path(__file__).resolve().parents[4]/'rl/srairl/upstream/data/sample_data.pkl')
+    if not args.data_path:raise ValueError('--data_path is required; provide a native MetaDrive demonstration archive')
     if not args.output_dir:args.output_dir=str(Path(__file__).resolve().parent/'results')
     main(args)
 

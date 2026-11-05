@@ -16,7 +16,7 @@ def test_closed_loop_evaluation_defaults_to_meta_drive_physics_and_candidate_rep
 def test_closed_loop_evaluation_rejects_invalid_candidate_count_and_merge_distribution():
     with pytest.raises(ValueError, match="Planner 候选数"):
         clean_interaction_evaluation_request({"pipeline_candidates": 0})
-    with pytest.raises(ValueError, match="NGSIM 初始分布"):
+    with pytest.raises(ValueError, match="MetaDrive 综合评估只使用场景内的标准化初始布局"):
         clean_interaction_evaluation_request({
             "pipeline_scenario": "merge",
             "pipeline_initialization": "ngsim_distribution",

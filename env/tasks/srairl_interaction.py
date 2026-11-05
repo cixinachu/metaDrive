@@ -16,7 +16,7 @@ class SRAIRLInteractionScenario:
     rlv_target_x: float = 55.
     rlv_target_speed: float = 18.
     interaction_start_x: float = 40.
-    interaction_end_x: float = 120.
+    interaction_end_x: float = 250.
     success_lateral_tolerance_m: float = .4
     success_stable_steps: int = 10
 

@@ -58,6 +58,26 @@ class TrajectoryDataset(Dataset):
         self.skip = skip
         self.seq_len = self.obs_len + self.pred_len
 
+        if str(save_dir).endswith('.npz'):
+            from datasets.srairl.native_windows import load_native_windows
+            split = 'train' if if_test == 'train' else 'validation' if if_test == 'val' else 'test'
+            windows = load_native_windows(save_dir, split=split)
+            if not windows:
+                raise ValueError(f'Native MetaDrive dataset has no {split} windows')
+            role_index = {'lcv': 0, 'fv': 1, 'nlv': 2, 'olv': 3}
+            values = {key: [] for key in role_index}
+            history_states=[]
+            for window in windows:
+                for key, role in role_index.items():
+                    values[key].append(window.future[:, role, :4])
+                history_states.append(window.history_state)
+            self.lcv_traj = torch.as_tensor(np.stack(values['lcv']), dtype=torch.float32)
+            self.fv_traj = torch.as_tensor(np.stack(values['fv']), dtype=torch.float32)
+            self.nlv_traj = torch.as_tensor(np.stack(values['nlv']), dtype=torch.float32)
+            self.olv_traj = torch.as_tensor(np.stack(values['olv']), dtype=torch.float32)
+            self.joint_history = torch.as_tensor(np.stack(history_states),dtype=torch.float32)
+            return
+
         file = open(save_dir, 'rb')
         all_data = pickle.load(file)
         file.close()
@@ -94,6 +114,7 @@ class TrajectoryDataset(Dataset):
         self.fv_traj = torch.from_numpy(np.concatenate(fv_data)).type(torch.float)
         self.nlv_traj = torch.from_numpy(np.concatenate(nlv_data)).type(torch.float)
         self.olv_traj = torch.from_numpy(np.concatenate(olv_data)).type(torch.float)
+        self.joint_history = None
 
     def __len__(self):
         return len(self.lcv_traj)
@@ -104,4 +125,4 @@ class TrajectoryDataset(Dataset):
             self.lcv_traj[index, :], self.fv_traj[index, :],
             self.nlv_traj[index, :], self.olv_traj[index, :]
         ]
-        return out
+        return out if self.joint_history is None else out+[self.joint_history[index]]

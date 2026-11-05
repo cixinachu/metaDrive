@@ -52,6 +52,28 @@ class SequenceDataset(torch.utils.data.Dataset):
         self.use_padding = use_padding
         self.max_path_length = 151
 
+        self.native = str(data_path).endswith('.npz')
+        if self.native:
+            from datasets.srairl.native_windows import load_native_windows
+            split = 'validation' if if_test else 'train'
+            windows = load_native_windows(data_path, split=split)
+            self.record_trajectory=[];self.record_goal=[]
+            for window in windows:
+                roles=[]
+                for role in range(4):
+                    values=window.history[:,role,:4].copy()
+                    roles.append(values)
+                self.record_trajectory.append(roles)
+                current=window.history[-1,0]
+                final=window.future[-1,0]
+                self.record_goal.append(np.asarray([final[1]-current[1],final[2]-current[2]],dtype=np.float32))
+            if not self.record_goal:
+                raise ValueError(f'Native MetaDrive dataset has no {split} windows')
+            goals=np.stack(self.record_goal)
+            self.max_x,self.min_x=float(goals[:,0].max()),float(goals[:,0].min())
+            self.max_v,self.min_v=float(goals[:,1].max()),float(goals[:,1].min())
+            return
+
         with open(data_path, "rb") as input_file:
             data = pickle.load(input_file)
 
@@ -107,6 +129,14 @@ class SequenceDataset(torch.utils.data.Dataset):
         return len(self.record_trajectory)
 
     def __getitem__(self, idx, eps=1e-4):
+        if self.native:
+            roles=[x.copy() for x in self.record_trajectory[idx]]
+            goal=self.record_goal[idx].copy()
+            for values in roles:
+                values[:,0]=np.clip(values[:,0]/50.,-1.,1.)
+                values[:,1]=np.clip(values[:,1]/500.,-1.,1.)
+                values[:,2:4]=np.clip((values[:,2:4]+40.)/80.,-1.,1.)
+            return [*roles,goal]
         lcv = self.record_trajectory[idx][0][['y', 'x', 'v_x', 'v_y']].values
         fv = self.record_trajectory[idx][1][['y', 'x', 'v_x', 'v_y']].values
         nlv = self.record_trajectory[idx][2][['y', 'x', 'v_x', 'v_y']].values
@@ -279,7 +309,7 @@ def main(args):
 if __name__ == '__main__':
     parser=argparse.ArgumentParser()
     parser.add_argument('--device',default='cpu')
-    parser.add_argument('--data_path',default=str(Path(__file__).resolve().parents[4]/'rl/srairl/upstream/data/sample_data.pkl'))
+    parser.add_argument('--data_path',required=True)
     parser.add_argument('--output_dir',default='')
     parser.add_argument('--studio_dir',default='')
     parser.add_argument('--epochs',type=int,default=100000)

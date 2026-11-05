@@ -7,7 +7,7 @@ from pathlib import Path
 
 EXPECTED = {
     "obs_len": 20, "pred_len": 100, "horizon": 100, "dt": 0.1,
-    "state_dim": 16, "history_len": 4,
+    "state_dim": 16,
 }
 
 
@@ -55,10 +55,14 @@ class SRAIRLModelBundle:
         for key, expected in EXPECTED.items():
             if key in combined and combined[key] != expected:
                 errors.append(f"{key}={combined[key]!r}, expected {expected!r}")
-        planner_revision = self.planner_metadata.get("dataset_revision")
-        predictor_revision = self.predictor_metadata.get("dataset_revision")
+        planner_revision = self.planner_metadata.get("source_dataset_revision")
+        predictor_revision = self.predictor_metadata.get("source_dataset_revision")
         if planner_revision and predictor_revision and planner_revision != predictor_revision:
-            errors.append("planner and predictor dataset revisions differ")
+            errors.append("planner and predictor source dataset revisions differ")
+        planner_split=self.planner_metadata.get("split_version")
+        predictor_split=self.predictor_metadata.get("split_version")
+        if planner_split and predictor_split and planner_split!=predictor_split:
+            errors.append("planner and predictor split versions differ")
         if self.planner_metadata.get("normalization_version") not in (None, "planner-goal-v1"):
             errors.append("Planner checkpoint normalization does not match planner-goal-v1")
         if self.predictor_metadata.get("normalization_version") not in (None, "reward-predictor-v1"):
@@ -110,23 +114,21 @@ class SRAIRLModelBundle:
         payloads = [torch_load_metadata(path) for path in paths]
         goal_meta, planner_meta, guide_meta, predictor_meta = [p.get("metadata", {}) for p in payloads]
         requirements = (
-            ("Goal Predictor", goal_meta, {"obs_len", "pred_len", "horizon", "dt"}),
-            ("Planner", planner_meta, {"obs_len", "pred_len", "horizon", "dt"}),
-            ("Reward Guide", guide_meta, {"obs_len", "pred_len", "dt", "state_dim", "history_len"}),
-            ("Predictor", predictor_meta, {"obs_len", "pred_len", "dt", "state_dim", "history_len"}),
+            ("Goal Predictor", goal_meta, {"obs_len", "pred_len", "horizon", "dt","source_dataset_revision","component_dataset_revision","split_version"}),
+            ("Planner", planner_meta, {"obs_len", "pred_len", "horizon", "dt","source_dataset_revision","component_dataset_revision","split_version"}),
+            ("Reward Guide", guide_meta, {"obs_len", "pred_len", "dt", "state_dim", "history_len","source_dataset_revision","component_dataset_revision","split_version"}),
+            ("Predictor", predictor_meta, {"obs_len", "pred_len", "dt", "state_dim", "history_len","source_dataset_revision","component_dataset_revision","split_version"}),
         )
         for name, metadata, required in requirements:
             missing = required - set(metadata)
             if missing:
                 raise ValueError(f"{name} checkpoint lacks compatibility metadata: {sorted(missing)}")
-            if not metadata.get("dataset_revision"):
-                raise ValueError(f"{name} checkpoint lacks dataset revision")
-        if goal_meta["dataset_revision"] != planner_meta["dataset_revision"]:
-            raise ValueError("Goal Predictor and Planner use different dataset revisions")
-        if guide_meta["dataset_revision"] != predictor_meta["dataset_revision"]:
-            raise ValueError("Reward Guide and Predictor use different dataset revisions")
-        if planner_meta["dataset_revision"] != predictor_meta["dataset_revision"]:
-            raise ValueError("Planner and Predictor use different dataset revisions")
+        source_revisions={meta['source_dataset_revision'] for _,meta,_ in requirements}
+        split_versions={meta['split_version'] for _,meta,_ in requirements}
+        if len(source_revisions)!=1:
+            raise ValueError("all generative components must use the same source MetaDrive dataset revision")
+        if len(split_versions)!=1:
+            raise ValueError("all generative components must use the same episode split version")
         goal_arch = payloads[0].get("architecture", {})
         if goal_arch.get("context_dim") != 128 or goal_arch.get("input_size") != 2:
             raise ValueError("Goal Predictor architecture must use context_dim=128 and input_size=2")
@@ -141,8 +143,14 @@ class SRAIRLModelBundle:
             reward_dir = reward_dir.parent
         reward_config = json.loads((reward_dir / "config.json").read_text(encoding="utf-8"))
         reward_settings = reward_config.get("srairl", {})
-        if reward_settings.get("frame_state_dim") != 16 or reward_settings.get("history_len") != 4:
-            raise ValueError("SR-AIRL reward model must use 16D frames and history_len=4")
+        if reward_config.get("reward_version")!="temporal-dynamic-v2" or reward_settings.get("frame_state_dim") != 16 or reward_settings.get("history_len") != 11:
+            raise ValueError("SR-AIRL reward model must use 16D frames and history_len=11")
+        action_scale=reward_config.get("training",{}).get("action_scale")
+        if action_scale is None or action_scale>1.5+1e-8:
+            raise ValueError("SR-AIRL policy action scale must remain inside the calibrated ±1.5 m/s² domain")
+        reward_revision=reward_config.get("source_dataset_revision")
+        if reward_revision and reward_revision not in source_revisions:
+            raise ValueError("SR-AIRL reward checkpoint uses a different MetaDrive source dataset revision")
         planner_contract = {**planner_meta, "goal_architecture": goal_arch,
                             "planner_contract": {"transition_order": ["ax", "ay", "y", "x", "vx", "vy"],
                                                  "n_diffusion_steps": 20}}

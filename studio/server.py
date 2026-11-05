@@ -53,7 +53,9 @@ def srairl_model_catalog():
     result=[]
     for p in sorted((ROOT/'models').glob('*/config.json'),key=lambda p:p.stat().st_mtime,reverse=True):
         meta=read_json(p,{}) or {}
-        if meta.get('algorithm')!='SR-AIRL' or not (p.parent/'policy_elcv.pt').is_file() or not (p.parent/'policy_rfv.pt').is_file():continue
+        if meta.get('algorithm')!='SR-AIRL' or meta.get('reward_version')!='temporal-dynamic-v2' or \
+           meta.get('srairl',{}).get('history_len')!=11 or \
+           not (p.parent/'policy_elcv.pt').is_file() or not (p.parent/'policy_rfv.pt').is_file():continue
         result.append(dict(id=str(p.parent.relative_to(ROOT)),label=f"SR-AIRL · {p.parent.name}",path=str(p.parent.relative_to(ROOT)),
                            episode=meta.get('episode',0),global_steps=meta.get('global_steps',0),
                            dynamics_mode=meta.get('dynamics_mode','legacy_kinematic'),
@@ -70,9 +72,16 @@ def srairl_expert_catalog():
         try:
             import numpy as np
             with np.load(path,allow_pickle=False) as data:metadata=json.loads(str(data['metadata'].item()))
-            result.append(dict(id=str(path.relative_to(ROOT)),label=f"MetaDrive 示范 · {metadata.get('scenario','?')} · {metadata.get('transition_pairs',0)} 对",
+            from datasets.srairl.native_windows import native_dataset_info
+            info=native_dataset_info(path)
+            result.append(dict(id=str(path.relative_to(ROOT)),label=f"MetaDrive 示范 · {metadata.get('scenario','?')} · {info['episodes']} episodes · {info['windows']} windows",
                 path=str(path.relative_to(ROOT)),transition_pairs=metadata.get('transition_pairs',0),scenario=metadata.get('scenario'),
-                controller=metadata.get('controller'),seed=metadata.get('seed')))
+                controller=metadata.get('controller'),seed=metadata.get('seed'),episodes=info['episodes'],
+                attempted_episodes=metadata.get('episodes',info['episodes']),
+                rejected_episodes=max(0,int(metadata.get('episodes',info['episodes']))-info['episodes']),
+                acceptance_rate=info['episodes']/max(1,int(metadata.get('episodes',info['episodes']))),
+                windows=info['windows'],windows_by_split=info['windows_by_split'],
+                windows_by_scenario=info['windows_by_scenario'],split_protocol=info['split_protocol']))
         except Exception:
             continue
     return result
@@ -327,7 +336,7 @@ class Handler(BaseHTTPRequestHandler):
         parsed=urlparse(self.path);path=parsed.path;q=parse_qs(parsed.query)
         if path=='/api/catalog':
             calibration=read_json(ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',{})
-            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_pipeline_bundles=srairl_pipeline_bundle_catalog(),srairl_expert_datasets=srairl_expert_catalog(),ngsim_scenarios=read_json(ROOT/'configs/datasets/ngsim_scenario_taxonomy.json',{}),srairl_action_calibration=calibration))
+            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_pipeline_bundles=srairl_pipeline_bundle_catalog(),srairl_expert_datasets=srairl_expert_catalog(),srairl_action_calibration=calibration))
         if path=='/api/datasets/catalog':
             return self.respond(dataset_catalog())
         if path=='/api/jobs':

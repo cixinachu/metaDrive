@@ -79,6 +79,29 @@ class TrajectoryDataset(Dataset):
         self.skip = skip
         self.seq_len = self.obs_len + self.pred_len
 
+        if str(save_dir).endswith('.npz'):
+            from datasets.srairl.native_windows import load_native_windows
+            split = 'train' if if_test == 'train' else 'validation' if if_test in ('val', 'test') else 'test'
+            windows = load_native_windows(save_dir, split=split)
+            if not windows:
+                raise ValueError(f'Native MetaDrive dataset has no {split} windows')
+            hist_data, cond_data, pred_data, state_data = [], [], [], []
+            for window in windows:
+                # The RFV history ends at t; predictions and conditions cover t+1..t+100.
+                hist = window.history[:, 1, :].copy()
+                pred = window.future[:, 1, :].copy()
+                cond = window.future[:, 0, :].copy()
+                cond[:, :2] -= hist[0, :2]
+                hist_data.append(hist)
+                cond_data.append(cond)
+                pred_data.append(pred)
+                state_data.append(window.state)
+            self.hist_traj = torch.as_tensor(np.stack(hist_data), dtype=torch.float32)
+            self.cond_traj = torch.as_tensor(np.stack(cond_data), dtype=torch.float32)
+            self.pred_traj = torch.as_tensor(np.stack(pred_data), dtype=torch.float32)
+            self.state_data = torch.as_tensor(np.stack(state_data), dtype=torch.float32)
+            return
+
         file = open(save_dir, 'rb')
         all_data = pickle.load(file)
         file.close()

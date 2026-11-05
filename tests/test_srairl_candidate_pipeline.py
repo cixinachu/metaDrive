@@ -181,7 +181,7 @@ def test_procedural_warmup_produces_real_history_then_resets_episode_metrics():
         assert env.steps == 0 and env.time == 0.0
         assert env.distance_travelled_m == 0.0
         assert not env._metadrive_collision and not env._metadrive_out_of_road
-        expected_start = actual["elcv"][-1, 1] - env.world._interaction_s_offset
+        expected_start = actual["elcv"][-1, 1]
         assert phase["evaluation_start_s"] == pytest.approx(expected_start)
     finally:
         env.close()
@@ -276,10 +276,10 @@ def test_model_bundle_rejects_dimension_and_revision_mismatch(tmp_path):
         path = tmp_path / name
         path.write_bytes(b"checkpoint")
         paths.append(path)
-    with pytest.raises(ValueError, match="dataset revisions"):
+    with pytest.raises(ValueError, match="source dataset revisions"):
         SRAIRLModelBundle(*paths,
-            planner_metadata={"horizon": 100, "dataset_revision": "a"},
-            predictor_metadata={"horizon": 100, "dataset_revision": "b"},
+            planner_metadata={"horizon": 100, "source_dataset_revision": "a"},
+            predictor_metadata={"horizon": 100, "source_dataset_revision": "b"},
             normalization={"planner_goal": "planner-goal-v1",
                            "reward_predictor": "reward-predictor-v1"})
 

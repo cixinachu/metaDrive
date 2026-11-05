@@ -33,7 +33,7 @@ def split_latest_state(states):
     }
 
 
-def extract_private_state(states, role, history_len=4):
+def extract_private_state(states, role, history_len=11):
     frames = states.reshape(-1, history_len, 16)
     elcv = frames[..., 0:4]
     rfv_rel = frames[..., 4:8]
@@ -43,7 +43,29 @@ def extract_private_state(states, role, history_len=4):
         ego = elcv - rfv_rel
     else:
         raise ValueError(role)
-    return ego.reshape(states.shape[0], -1)
+    return ego
+
+
+class TemporalConvReward(nn.Module):
+    """Causal TCN over the configured per-role history (11 frames in v2)."""
+    def __init__(self, history_len, hidden=64):
+        super().__init__()
+        self.history_len=int(history_len)
+        self.input_projection=nn.Conv1d(4,hidden,kernel_size=1)
+        self.convs=nn.ModuleList(nn.Conv1d(hidden,hidden,kernel_size=3,dilation=d) for d in (1,2,4))
+        self.projections=nn.ModuleList(nn.Conv1d(hidden,hidden,kernel_size=1) for _ in self.convs)
+        self.output=nn.Sequential(nn.Linear(hidden,hidden),nn.ReLU(),nn.Linear(hidden,1))
+
+    def forward(self, sequence):
+        if sequence.ndim!=3 or sequence.shape[1:]!=(self.history_len,4):
+            raise ValueError(f"TCN expects [batch,{self.history_len},4], got {tuple(sequence.shape)}")
+        values=self.input_projection(sequence.transpose(1,2))
+        for conv,projection in zip(self.convs,self.projections):
+            residual=values
+            values=F.pad(values,(2*conv.dilation[0],0))
+            values=F.relu(conv(values))
+            values=projection(values)+residual
+        return self.output(values[:,:,-1])
 
 
 class AnisotropicInteractionPotential(nn.Module):
@@ -110,7 +132,7 @@ class SocialAIRLDiscrim(nn.Module):
             raise ValueError("alpha_init and gamma must be positive (gamma <= 1)")
         self.role, self.history_len, self.gamma = role, int(history_len), float(gamma)
         self.interaction_potential = shared_interaction_potential
-        self.private_g = build_mlp(4 * history_len, 1, hidden_units_r, nn.ReLU(inplace=True))
+        self.private_g = TemporalConvReward(history_len)
         self.h = build_mlp(state_shape, 1, hidden_units_v, nn.ReLU(inplace=True))
         alpha = torch.tensor(float(alpha_init))
         self.alpha_raw = nn.Parameter(torch.log(torch.expm1(alpha)))
