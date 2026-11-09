@@ -198,7 +198,7 @@ def merge_expert_archives(paths, output_path, metadata=None):
     paths=[Path(path) for path in paths]
     if not paths:
         raise ValueError('at least one MetaDrive expert archive is required')
-    transitions=[];episodes=[];sources=[]
+    transitions=[];episodes=[];sources=[];seen_episodes=set();geometry_version=None;reference_version=None
     for path in paths:
         current,current_metadata=load_transitions(path,split='all')
         transitions.extend(current);sources.append({'sha256':hashlib.sha256(path.read_bytes()).hexdigest()})
@@ -209,6 +209,20 @@ def merge_expert_archives(paths, output_path, metadata=None):
             state_offsets=archive['trajectory_state_offsets'].astype(np.int64)
             action_offsets=archive['trajectory_action_offsets'].astype(np.int64)
             for index,row in enumerate(episode_metadata):
+                identity=(str(row.get('scenario','')),int(row['seed']))
+                if identity in seen_episodes:
+                    raise ValueError(f'duplicate expert episode/seed: {identity}')
+                seen_episodes.add(identity)
+                version=row.get('road_geometry',{}).get('version')
+                if not version:
+                    raise ValueError('legacy expert archive has no road geometry provenance; recollect for formal training')
+                if geometry_version is not None and version != geometry_version:
+                    raise ValueError('cannot merge different road geometry versions')
+                geometry_version=version
+                current_reference=row.get('reference_frame_version')
+                if not current_reference or (reference_version is not None and reference_version!=current_reference):
+                    raise ValueError('cannot merge missing or different reference coordinate versions')
+                reference_version=current_reference
                 ss,se=map(int,state_offsets[index:index+2]);aa,ae=map(int,action_offsets[index:index+2])
                 episodes.append({**row,'role_order':archive['role_order'].astype(str).tolist(),
                     'role_states':archive['role_states'][ss:se].copy(),
@@ -217,7 +231,8 @@ def merge_expert_archives(paths, output_path, metadata=None):
                     'times_s':archive['trajectory_times_s'][ss:se].copy(),
                     'desired_acceleration':archive['trajectory_desired_acceleration'][aa:ae].copy(),
                     'metadrive_actions':archive['trajectory_metadrive_actions'][aa:ae].copy(),
-                    'actual_acceleration':archive['trajectory_actual_acceleration'][aa:ae].copy()})
+                    'actual_acceleration':archive['trajectory_actual_acceleration'][aa:ae].copy(),
+                    **({'tracking_errors':archive['trajectory_tracking_errors'][aa:ae].copy()} if 'trajectory_tracking_errors' in archive.files else {})})
     merged_metadata={'source':'MetaDrive','scene_source':'procedural','source_archives':sources,
                      'scenarios':sorted({str(row.get('scenario','unknown')) for row in episodes}),
                      **(metadata or {})}

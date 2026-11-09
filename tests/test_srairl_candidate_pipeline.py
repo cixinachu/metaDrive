@@ -15,6 +15,7 @@ from rl.srairl.pipeline.selector import CandidateSelector
 
 
 class StraightLane:
+    length = 10000.0
     def local_coordinates(self, point):
         return float(point[0]), float(point[1])
 
@@ -221,7 +222,9 @@ def test_rlv_forecast_starts_at_next_timestep():
         _source_lane = StraightLane()
         world = World()
 
-    current, target = forecast_rlv_roles(LaneEnv(), {}, horizon=100, dt=0.1)
+    history={role:np.tile([0.,x,10.,0.],(20,1))
+             for role,x in (('rlv_current',20.),('rlv_target',40.))}
+    current, target = forecast_rlv_roles(LaneEnv(), history, horizon=100, dt=0.1)
     assert current.states[0, 1] == pytest.approx(21.0)
     assert current.states[-1, 1] == pytest.approx(120.0)
     assert target.states[0, 1] == pytest.approx(41.0)

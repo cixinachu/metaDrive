@@ -36,10 +36,17 @@ def path_geometry(path, samples_per_lane=400, details=False):
             "min_radius_m": float(1.0 / k[max_index]) if k[max_index] > 1e-9 else None,
             "max_curvature_s_m": float(s[max_index]),
         })
+    joins=[]
+    for first,second in zip(path,path[1:]):
+        h0=first.heading_theta_at(first.length);h1=second.heading_theta_at(0.)
+        joins.append({'position_gap_m':float(np.linalg.norm(np.asarray(first.position(first.length,0.))-np.asarray(second.position(0.,0.)))),
+                      'heading_jump_rad':float(abs((h1-h0+np.pi)%(2*np.pi)-np.pi))})
     values = np.concatenate(all_k) if all_k else np.asarray([0.0])
     max_k = float(np.max(values))
     return {
         "lane_count": len(path),
+        "joins": joins,
+        "continuous": all(j["position_gap_m"]<0.05 and j["heading_jump_rad"]<0.01 for j in joins),
         "length_m": float(sum(float(lane.length) for lane in path)),
         "max_curvature_per_m": max_k,
         "min_radius_m": float(1.0 / max_k) if max_k > 1e-9 else None,
@@ -51,7 +58,7 @@ def path_geometry(path, samples_per_lane=400, details=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenarios", nargs="+", choices=("curve", "merge"), default=("curve", "merge"))
+    parser.add_argument("--scenarios", nargs="+", choices=("straight", "curve", "merge"), default=("straight", "curve", "merge"))
     parser.add_argument("--lane-num", type=int, default=3)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--samples-per-lane", type=int, default=400)
@@ -59,7 +66,7 @@ def main():
     parser.add_argument("--closed-loop", action="store_true",
                         help="also collect a MetaDrive teacher episode at each requested speed")
     parser.add_argument("--closed-loop-episodes", type=int, default=1)
-    parser.add_argument("--speeds", nargs="+", type=float, default=(6, 10, 15, 20, 25))
+    parser.add_argument("--speeds", nargs="+", type=float, default=(15, 20, 25))
     args = parser.parse_args()
     reports = []
     for scenario in args.scenarios:
@@ -69,14 +76,17 @@ def main():
         )
         try:
             world.reset(seed=args.seed)
+            if scenario == "merge":world.spawn_interaction_roles()
             ego = world.role_vehicle("elcv")
             ramp_or_curve_path = world._lane_path(ego.lane)
             if scenario == "curve":
                 first_road=world.current_map.road_network.graph[">>"][">>>"]
                 paths={f"curve_route_lane_{index}":world._lane_path(lane)
                        for index,lane in enumerate(first_road)}
+            elif scenario == "straight":
+                paths={"straight_route":ramp_or_curve_path}
             else:
-                paths={"merge_ramp_to_mainline_route":ramp_or_curve_path}
+                paths={"merge_ramp_to_mainline_route":world._merge_ramp_reference_path}
                 graph = world.current_map.road_network.graph
                 paths["merge_mainline_lane_2"] = world._lane_path(graph[">>>"]["1r0_0_"][2])
             for name, path in paths.items():
@@ -98,11 +108,8 @@ def main():
         for scenario in args.scenarios:
             for speed in args.speeds:
                 base=SRAIRLInteractionScenario()
-                if scenario=="curve":
-                    interaction=replace(base,elcv_speed=speed,rfv_speed=speed,
-                        rlv_current_speed=speed,rlv_target_speed=speed)
-                else:
-                    interaction=replace(base,elcv_speed=speed,rlv_current_speed=speed)
+                interaction=replace(base,elcv_speed=speed,rfv_speed=speed,
+                    rlv_current_speed=speed,rlv_target_speed=speed)
                 env=SRAIRLProceduralEnv(scenario,args.lane_num,0.,args.seed,700,
                     interaction_scenario=interaction)
                 try:
@@ -140,6 +147,7 @@ def main():
                     env.close()
     print(json.dumps({
         "simulator": "MetaDrive",
+        "road_geometry": __import__("env.tasks.srairl_interaction",fromlist=["ROAD_GEOMETRY_CONFIG"]).ROAD_GEOMETRY_CONFIG,
         "seed": args.seed,
         "lane_num": args.lane_num,
         "samples_per_lane": args.samples_per_lane,

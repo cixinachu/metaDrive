@@ -82,7 +82,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         _,longitudinal,lateral,lane,s=best
         heading=float(lane.heading_theta_at(s));tangent=np.asarray([np.cos(heading),np.sin(heading)])
         normal=np.asarray([-tangent[1],tangent[0]])
-        return np.asarray([lateral,longitudinal,float(velocity@tangent),float(velocity@normal)])
+        return np.asarray([-lateral,longitudinal,float(velocity@tangent),float(velocity@normal)])
 
     def _vehicle_pool(self):
         vehicles=list(self.world.agents.values())
@@ -96,10 +96,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         other=self.world.role_vehicle("rfv")
         def state(vehicle,role):
             if self._is_merge:
-                if role in ('elcv','rlv_current'):
-                    path=self._merge_reference_path;offset=self._world_path_offset
-                else:
-                    path=self._merge_mainline_path;offset=self._merge_mainline_offset
+                path=self._merge_mainline_path;offset=self._merge_mainline_offset
             else:
                 path=self._source_lane_path;offset=self._world_path_offset
             result=self._path_state(vehicle,path);result[1]-=offset
@@ -108,6 +105,17 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         current=state(self.world.role_vehicle('rlv_current'),'rlv_current')
         target=state(self.world.role_vehicle('rlv_target'),'rlv_target')
         return {"elcv":ego_state,"rfv":other_state,"rlv_current":current,"rlv_target":target}
+
+    def reference_to_world(self,role,state):
+        """Invert the shared observation frame using the complete native route."""
+        y,x,vlong,vlat=map(float,state)
+        path=self._merge_mainline_path if self._is_merge else self._source_lane_path
+        offset=self._merge_mainline_offset if self._is_merge else self._world_path_offset
+        lane,s=self.world._path_position(path,x+offset)
+        point=np.asarray(lane.position(s,-y),dtype=float)[:2]
+        h=float(lane.heading_theta_at(s));tangent=np.asarray([np.cos(h),np.sin(h)])
+        velocity=vlong*tangent+vlat*np.asarray([-tangent[1],tangent[0]])
+        return np.concatenate((point,velocity))
 
     def reset(self,seed=None):
         self._close_warmup_policies()
@@ -125,7 +133,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         # in [start_seed, start_seed + num_scenarios). Seed every episode
         # explicitly so another map cannot leak global RNG state into it.
         stale=[v.id for v in getattr(self.world,'interaction_vehicles',{}).values()]
-        if stale:self.world.engine.clear_objects(stale,force_destroy=True)
+        if stale and self.world.engine is not None:self.world.engine.clear_objects(stale,force_destroy=True)
         self.world.interaction_vehicles={}
         _,world_info=self.world.reset(seed=int(self._active_seed))
         if self._is_merge:
@@ -150,6 +158,8 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
             self._source_lane_path=self.world._interaction_lane_paths[self.interaction_scenario.source_lane]
             self._target_lane_path=self.world._interaction_lane_paths[self.interaction_scenario.target_lane]
             self._world_path_offset=float(self.world._interaction_s_offset)
+        self._native_drivable_lanes=[lane for outgoing in self.world.current_map.road_network.graph.values()
+            for lanes in outgoing.values() for lane in lanes]
         self.world.set_role_colors()
         roles=self._roles_live()
         obs=self.observer.reset(roles)
@@ -170,7 +180,11 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
             self._merge_start_x=float(ego.position[0])
             self._merge_complete_x=None
             self._evaluation_start_s=self._path_state(ego,self._merge_reference_path)[1]-self._world_path_offset
-            self._evaluation_end_s=self._evaluation_start_s+150.
+            # The experiment zone must include the entire physical taper and
+            # the stable-lane completion interval after it.
+            self._evaluation_end_s=max(float(self.interaction_scenario.interaction_end_x),
+                self.world._merge_transition_end_s-self._world_path_offset+
+                self.interaction_scenario.elcv_speed*self.dt*(self.interaction_scenario.success_stable_steps+5))
         else:
             self._evaluation_start_s=float(self.interaction_scenario.elcv_x)
             self._evaluation_end_s=float(self.interaction_scenario.interaction_end_x)
@@ -209,7 +223,11 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
             self._merge_start_x=float(ego.position[0])
             self._merge_complete_x=None
             self._evaluation_start_s=self._path_state(ego,self._merge_reference_path)[1]-self._world_path_offset
-            self._evaluation_end_s=self._evaluation_start_s+150.
+            # The experiment zone must include the entire physical taper and
+            # the stable-lane completion interval after it.
+            self._evaluation_end_s=max(float(self.interaction_scenario.interaction_end_x),
+                self.world._merge_transition_end_s-self._world_path_offset+
+                self.interaction_scenario.elcv_speed*self.dt*(self.interaction_scenario.success_stable_steps+5))
         else:
             ego_s=float(self._roles_live()['elcv'][1])
             self._evaluation_start_s=float(ego_s)
@@ -266,7 +284,17 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         controls=override if override is not None else {
             role:self._to_metadrive_action(self.world.role_vehicle(role),policy_actions[role])
             for role in ("elcv","rfv")}
+        before_motion={role:(np.asarray(self.world.role_vehicle(role).velocity[:2],dtype=float).copy(),
+                             float(self.world.role_vehicle(role).heading_theta)) for role in controls}
         _,_,terminated,truncated,world_info=self.world.step(controls)
+        control_telemetry={}
+        for role,(velocity,heading) in before_motion.items():
+            acceleration=(np.asarray(self.world.role_vehicle(role).velocity[:2])-velocity)/self.dt
+            tangent=np.asarray([np.cos(heading),np.sin(heading)])
+            normal=np.asarray([-tangent[1],tangent[0]])
+            control_telemetry[role]={'desired_acceleration':policy_actions[role].tolist(),
+                'metadrive_action':np.asarray(controls[role],dtype=float).tolist(),
+                'measured_acceleration':[float(acceleration@tangent),float(acceleration@normal)]}
         if self.rfv_response=='fixed_speed':
             vehicle=self.world.role_vehicle('rfv');lane=vehicle.lane
             s,_=lane.local_coordinates(vehicle.position[:2]);heading=float(lane.heading_theta_at(s))
@@ -298,7 +326,27 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         tracking_reward=float(np.clip(roles["elcv"][2]/30.,-1.,1.))
         agents=[self.world.role_vehicle("elcv"),self.world.role_vehicle("rfv")]
         collision=any(bool(v.crash_vehicle or v.crash_object) for v in agents)
-        out_of_road=any(bool(v.on_yellow_continuous_line or not v.on_lane) for v in agents)
+        localization_miss=any(not v.on_lane for v in agents)
+        def physically_on_road(vehicle):
+            if vehicle.on_lane:return True
+            # Bullet ray localization can miss long native lane convex hulls.
+            # Verify the actual vehicle footprint against native lane bounds;
+            # virtual reference transitions must never count as road surface.
+            center=np.asarray(vehicle.position[:2]);heading=float(vehicle.heading_theta)
+            tangent=np.asarray([np.cos(heading),np.sin(heading)])
+            normal=np.asarray([-tangent[1],tangent[0]])
+            corners=[center+dx*vehicle.LENGTH*.5*tangent+dy*vehicle.WIDTH*.5*normal
+                     for dx in (-1,1) for dy in (-1,1)]
+            for corner in corners:
+                covered=False
+                for lane in self._native_drivable_lanes:
+                    s,d=lane.local_coordinates(corner)
+                    if 0<=s<=lane.length and abs(d)<=lane.width_at(s)*.5:
+                        covered=True;break
+                if not covered:return False
+            return True
+        out_of_road=any(bool(v.on_yellow_continuous_line or not physically_on_road(v)) for v in agents)
+        self._localization_miss=localization_miss
         self._metadrive_collision|=collision;self._metadrive_out_of_road|=out_of_road
         pool=self._vehicle_pool();distances=[];ttcs=[]
         for actor in agents:
@@ -321,12 +369,13 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         # the saved demonstration includes a real 10 s future tail.
         done=self.steps>=self.max_steps or (zone_exited and not getattr(self,"_expert_collection",False)) or collision or out_of_road or bool(terminated.get("__all__",False))
         self._done=bool(done)
-        info={"done":self._done,"time":self.time,"scenario_id":self.scenario.scenario_id,
+        info={"control_telemetry":control_telemetry,"dt_s":self.dt,"done":self._done,"time":self.time,"scenario_id":self.scenario.scenario_id,
               "tracking_reward":tracking_reward,"distance_travelled_m":self.distance_travelled_m,
               "collision_proxy_any":collision,"controlled_collision_proxy":bool(
                   np.linalg.norm(np.asarray(agents[0].position[:2])-np.asarray(agents[1].position[:2]))<
                   (agents[0].LENGTH+agents[1].LENGTH)*.5),
               "metadrive_primary_collision":collision,"metadrive_out_of_road":out_of_road,
+              "metadrive_localization_miss":localization_miss,
               "minimum_distance_m":min(distances) if distances else None,
               "minimum_ttc_s":min(ttcs) if ttcs else None,
               "traffic_vehicle_count":max(0,len(pool)-4),"scene_source":"procedural",
@@ -357,4 +406,6 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
 
     def close(self):
         self._close_warmup_policies()
-        if self.world is not None:self.world.close()
+        if self.world is not None:
+            self.world.close()
+            self.world.interaction_vehicles={}

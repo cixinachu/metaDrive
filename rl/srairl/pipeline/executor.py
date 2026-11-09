@@ -6,6 +6,7 @@ import numpy as np
 
 from env.tasks.srairl_trajectory_tracker import trajectory_tracking_metrics
 from .candidate_builder import build_joint_candidates
+from .selector import CandidateFeasibilityError
 from .evaluator import EpisodeMetrics
 from .schema import CandidateBundle, PlanningContext
 
@@ -159,7 +160,16 @@ class SRAIRLClosedLoopPipeline:
                 seed=int(seed) + 1000 * decisions,
             )
             metrics.predictor_latency_s.append(time.perf_counter() - started)
-            selected, returns = self.selector.select(joint, history=state_history)
+            try:
+                selected, returns = self.selector.select(joint, history=state_history)
+            except CandidateFeasibilityError as exc:
+                metrics.failure_type='model_candidates_infeasible'
+                metrics.failure_details=exc.diagnostics
+                metrics.candidate_count+=len(joint)
+                metrics.planning_steps+=1
+                metrics.total_decision_latency_s.append(time.perf_counter()-decision_started)
+                last_info=getattr(env,'_last_info',{})
+                break
             metrics.candidate_returns.append({"planning_step": decisions,
                                               "candidate_returns": returns,
                                               "selected_candidate_id": selected.candidate_id})
@@ -190,11 +200,14 @@ class SRAIRLClosedLoopPipeline:
                 controls = {}
                 for role, trajectory in (("elcv", selected.elcv), ("rfv", selected.rfv)):
                     vehicle = env.world.role_vehicle(role)
-                    lane = vehicle.lane if getattr(env, "scenario_type", None) == "merge" \
-                        else getattr(env, "_source_lane", vehicle.lane)
+                    lane = vehicle.lane
                     current_lane = self.tracker.lane_state(vehicle, lane)
                     target_lane = self._track_state(role, trajectory.states[reference_index], env)
-                    controls[role] = self.tracker.desired_acceleration(current_lane, target_lane)
+                    if hasattr(self.tracker,'path_curvature'):
+                        curvature=self.tracker.path_curvature(lane,current_lane[0])
+                        controls[role]=self.tracker.desired_acceleration(current_lane,target_lane,curvature=curvature)
+                    else:
+                        controls[role] = self.tracker.desired_acceleration(current_lane, target_lane)
                     tracked = trajectory_tracking_metrics(current_lane[None, :], target_lane[None, :])
                     for key, value in tracked.items():
                         metrics.tracker_errors.setdefault(f"{role}/{key}", []).append(value)

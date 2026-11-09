@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT))
+from env.adapters.srairl_calibration import action_calibration_passed, calibration_summary_path
 import argparse
 import csv
 import hashlib
@@ -56,6 +57,9 @@ def srairl_model_catalog():
         if meta.get('algorithm')!='SR-AIRL' or meta.get('reward_version')!='temporal-dynamic-v2' or \
            meta.get('srairl',{}).get('history_len')!=11 or \
            not (p.parent/'policy_elcv.pt').is_file() or not (p.parent/'policy_rfv.pt').is_file():continue
+        from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG, REFERENCE_FRAME_VERSION
+        if meta.get('road_geometry')!=ROAD_GEOMETRY_CONFIG or meta.get('reference_frame_version')!=REFERENCE_FRAME_VERSION or not meta.get('source_dataset_revision'):continue
+        if not all((p.parent/name).is_file() for name in ('discriminator_elcv.pt','discriminator_rfv.pt')):continue
         result.append(dict(id=str(p.parent.relative_to(ROOT)),label=f"SR-AIRL · {p.parent.name}",path=str(p.parent.relative_to(ROOT)),
                            episode=meta.get('episode',0),global_steps=meta.get('global_steps',0),
                            dynamics_mode=meta.get('dynamics_mode','legacy_kinematic'),
@@ -73,7 +77,7 @@ def srairl_expert_catalog():
             import numpy as np
             with np.load(path,allow_pickle=False) as data:metadata=json.loads(str(data['metadata'].item()))
             from datasets.srairl.native_windows import native_dataset_info
-            info=native_dataset_info(path)
+            info=native_dataset_info(path,require_current=True)
             result.append(dict(id=str(path.relative_to(ROOT)),label=f"MetaDrive 示范 · {metadata.get('scenario','?')} · {info['episodes']} episodes · {info['windows']} windows",
                 path=str(path.relative_to(ROOT)),transition_pairs=metadata.get('transition_pairs',0),scenario=metadata.get('scenario'),
                 controller=metadata.get('controller'),seed=metadata.get('seed'),episodes=info['episodes'],
@@ -92,6 +96,11 @@ def reward_guide_model_catalog():
     for p in sorted((ROOT/'models').glob('*/results/best_model.pth'),key=lambda p:p.stat().st_mtime,reverse=True):
         meta=read_json(p.parents[1]/'summary.json',{}) or {}
         if meta.get('task')!='reward_guide':continue
+        from rl.srairl.pipeline.model_bundle import torch_load_metadata
+        from env.tasks.srairl_interaction import REFERENCE_FRAME_VERSION
+        try:checkpoint_meta=torch_load_metadata(p).get('metadata',{})
+        except Exception:continue
+        if checkpoint_meta.get('reference_frame_version')!=REFERENCE_FRAME_VERSION or not checkpoint_meta.get('source_dataset_revision'):continue
         result.append(dict(id=str(p.parents[1].relative_to(ROOT)),label=f"SR-AIRL Reward Guide · {p.parents[1].name}",
                            path=str(p.relative_to(ROOT)),bytes=p.stat().st_size,metrics=meta.get('metrics',{})))
     return result
@@ -208,10 +217,8 @@ def start_job(kind,raw):
         raise ValueError(f'{descriptor.label} 尚未具备可运行的完整训练链：{descriptor.description}')
     if task=='evaluation':
         if kind!='eval':raise ValueError('综合生成式 SR-AIRL 任务只允许评估')
-        calibration=read_json(ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',{}) or {}
-        if calibration.get('equivalence_status')!='passed' or not all(
-            calibration.get('metrics',{}).get(axis,{}).get(split,{}).get('passed',False)
-            for axis in ('longitudinal','lateral') for split in ('calibration_grid','held_out')):
+        calibration=read_json(calibration_summary_path(),{}) or {}
+        if not action_calibration_passed(calibration,require_closed_loop=True):
             raise ValueError('Action Adapter 标定尚未通过网格和留出集，不能运行综合闭环评估')
         selected=next((m for m in srairl_pipeline_bundle_catalog() if m['id']==raw.get('pipeline_bundle_id')),None)
         if selected is None:raise ValueError('请选择具有完整兼容检查点的 SR-AIRL ModelBundle')
@@ -335,8 +342,9 @@ class Handler(BaseHTTPRequestHandler):
     def get(self):
         parsed=urlparse(self.path);path=parsed.path;q=parse_qs(parsed.query)
         if path=='/api/catalog':
-            calibration=read_json(ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',{})
-            return self.respond(dict(defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_pipeline_bundles=srairl_pipeline_bundle_catalog(),srairl_expert_datasets=srairl_expert_catalog(),srairl_action_calibration=calibration))
+            from env.tasks.srairl_interaction import SCENARIO_SPEED_CONFIG, ROAD_GEOMETRY_CONFIG
+            calibration=read_json(calibration_summary_path(),{})
+            return self.respond(dict(pipeline_calibration_passed=action_calibration_passed(calibration,require_closed_loop=True),srairl_road_geometry=ROAD_GEOMETRY_CONFIG,srairl_scenario_speeds=SCENARIO_SPEED_CONFIG,defaults=DEFAULTS,scenarios=[dict(id=k,name=v[0]) for k,v in SCENARIOS.items()],tasks={k:vars(v) for k,v in TASK_REGISTRY.items()},algorithms=ALGORITHM_NAMES,algorithm_metadata=algorithm_metadata(),models=model_catalog(),srairl_models=srairl_model_catalog(),reward_guide_models=reward_guide_model_catalog(),srairl_pipeline_bundles=srairl_pipeline_bundle_catalog(),srairl_expert_datasets=srairl_expert_catalog(),srairl_action_calibration=calibration))
         if path=='/api/datasets/catalog':
             return self.respond(dataset_catalog())
         if path=='/api/jobs':

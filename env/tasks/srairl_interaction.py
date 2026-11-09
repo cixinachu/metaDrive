@@ -3,6 +3,20 @@ from dataclasses import dataclass
 import math
 
 
+REFERENCE_FRAME_VERSION = "scenario-left-normal-v2"
+
+ROAD_GEOMETRY_CONFIG = {
+    "version": "srairl-highway-v4",
+    "curve_center_radius_m": 650.0,
+    "ramp_center_radius_m": 700.0,
+    "merge_transition_length_m": 160.0,
+    "ramp_acceleration_length_m": 200.0,
+    "ramp_extension_length_m": 160.0,
+    "target_speeds_mps": [15.0, 20.0, 25.0],
+    "lateral_acceleration_limit_mps2": 1.5,
+    "tracking_reserve_mps2": 0.5,
+}
+
 SCENARIO_SPEED_CONFIG = {
     "straight": {"elcv_speed": 22.0, "rfv_speed": 22.0,
                  "rlv_current_speed": 22.0, "rlv_target_speed": 22.0},
@@ -26,13 +40,13 @@ class SRAIRLInteractionScenario:
     source_lane: int = 0
     target_lane: int = 1
     elcv_x: float = 30.
-    elcv_speed: float = 20.
+    elcv_speed: float = SCENARIO_SPEED_CONFIG["straight"]["elcv_speed"]
     rfv_x: float = 15.
-    rfv_speed: float = 19.
+    rfv_speed: float = SCENARIO_SPEED_CONFIG["straight"]["rfv_speed"]
     rlv_current_x: float = 65.
-    rlv_current_speed: float = 18.
+    rlv_current_speed: float = SCENARIO_SPEED_CONFIG["straight"]["rlv_current_speed"]
     rlv_target_x: float = 55.
-    rlv_target_speed: float = 18.
+    rlv_target_speed: float = SCENARIO_SPEED_CONFIG["straight"]["rlv_target_speed"]
     interaction_start_x: float = 40.
     interaction_end_x: float = 250.
     success_lateral_tolerance_m: float = .4
@@ -76,6 +90,14 @@ class SRAIRLInteractionScenario:
             raise ValueError('target-lane gap must have positive length')
         if self.rlv_current_x<=self.elcv_x or min(self.elcv_speed,self.rfv_speed,self.rlv_current_speed,self.rlv_target_speed)<=0:
             raise ValueError('all four actors require positive speeds and RLV_current must be ahead of ELCV')
+        if any(not 0 < speed <= 25 for speed in (
+                self.elcv_speed, self.rfv_speed, self.rlv_current_speed, self.rlv_target_speed)):
+            raise ValueError('initial speeds must be in (0, 25] m/s; closed-loop calibration is additionally required')
+        if min(self.elcv_x, self.rfv_x, self.rlv_current_x, self.rlv_target_x) < 0:
+            raise ValueError('initial longitudinal positions must be nonnegative')
+        if min(self.rlv_current_x-self.elcv_x, self.elcv_x-self.rfv_x,
+               self.rlv_target_x-self.elcv_x) < 6:
+            raise ValueError('initial center gaps must be at least 6 m')
         if self.interaction_start_x >= self.interaction_end_x:
             raise ValueError('interaction zone must have positive length')
         if self.success_stable_steps < 1 or self.success_lateral_tolerance_m <= 0:

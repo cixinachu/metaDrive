@@ -22,13 +22,13 @@ class MetaDriveExpertController:
 
     def _target_lane(self,vehicle,role):
         if self.env._is_merge:
-            index=0 if str(vehicle.lane_index[0]).startswith('1r1_') else 2
-            a,b=vehicle.lane_index[:2];lanes=self.env.world.current_map.road_network.graph[a][b]
-            return lanes[min(index,len(lanes)-1)]
-        path=(self.env._source_lane_path
-              if int(self.target_lanes.get(role,self.env.interaction_scenario.target_lane))==
-              int(self.env.interaction_scenario.source_lane)
-              else self.env._target_lane_path)
+            path=(self.env.world._merge_ramp_reference_path if role=='elcv' else
+                  self.env.world._lane_path(self.env.world.current_map.road_network.graph['>>>']['1r0_0_'][2]))
+        else:
+            path=(self.env._source_lane_path
+                  if int(self.target_lanes.get(role,self.env.interaction_scenario.target_lane))==
+                  int(self.env.interaction_scenario.source_lane)
+                  else self.env._target_lane_path)
         position=np.asarray(vehicle.position,dtype=float)[:2]
         candidates=[]
         for lane in path:
@@ -189,19 +189,32 @@ def validate_expert_episode(raw, minimum_future_steps=100, minimum_history_steps
                 continuity_worst_role=continuity_worst_role,continuity_worst_frame=continuity_worst_frame)
 
 
-def collect_metadrive_expert(env, episodes, seed, callback=None):
+def collect_metadrive_expert(env, episodes, seed, callback=None, *, vary_initial_state=False):
     """Collect paired transitions and full-world trajectory records.
 
-    Each accepted episode contains 20 real IDM warm-up frames, then a complete
+    Each accepted episode contains 20 real lane-tracking warm-up frames, then a complete
     lane change followed by 100 real simulator frames. Invalid episodes remain
     available to the caller for quarantine but never enter the training data.
     """
     transitions=[];episode_rows=[];raw_episodes=[]
+    base_interaction=env.interaction_scenario
     env._expert_collection=True
     dt=float(env.dt);history_steps=20;future_steps=100
     for episode in range(int(episodes)):
         if callback and not callback(dict(state='running',step=episode,total=int(episodes),episodes=episode)):
             break
+        if vary_initial_state:
+            from dataclasses import replace
+            rng=np.random.default_rng(int(seed)+episode)
+            spec=replace(base_interaction,
+                rfv_x=base_interaction.elcv_x-float(rng.uniform(12.,24.)),
+                rlv_current_x=base_interaction.elcv_x+float(rng.uniform(28.,48.)),
+                rlv_target_x=base_interaction.elcv_x+float(rng.uniform(22.,42.)),
+                rfv_speed=float(np.clip(base_interaction.rfv_speed+rng.uniform(-1.,1.),1.,25.)),
+                rlv_current_speed=float(np.clip(base_interaction.rlv_current_speed+rng.uniform(-1.,1.),1.,25.)),
+                rlv_target_speed=float(np.clip(base_interaction.rlv_target_speed+rng.uniform(-1.,1.),1.,25.)))
+            env.interaction_scenario=spec.validate(env.lane_num)
+            env.world.set_interaction_scenario(spec)
         observations,_=env.reset(seed=int(seed)+episode)
         controller=MetaDriveExpertController(env)
         done=False;step=0;collisions=0;offroad=0;distance=0.;started=False;completed=False
@@ -209,12 +222,19 @@ def collect_metadrive_expert(env, episodes, seed, callback=None):
         initial_rfv_speed=float(env._rfv_initial_speed);final_rfv_speed=initial_rfv_speed;rfv_min_accel=0.
         raw_states=[_world_role_states(env)];reference_states=[_reference_role_states(env)]
         lane_indices=[_role_lane_indices(env)];times=[-history_steps*dt]
+        warmup_target=controller.target_lanes['elcv']
+        if not env._is_merge:controller.target_lanes['elcv']=env.interaction_scenario.source_lane
         for warm_step in range(history_steps):
-            observations,warm_info=env.warmup_step()
+            observations,warm_info=env.step({role:controller.action(role) for role in ('elcv','rfv')})
             raw_states.append(_world_role_states(env));reference_states.append(_reference_role_states(env))
             lane_indices.append(_role_lane_indices(env));times.append((warm_step+1-history_steps)*dt)
             if warm_info.get('metadrive_primary_collision') or warm_info.get('metadrive_out_of_road'):
                 done=True;break
+        controller.target_lanes['elcv']=warmup_target
+        if not done:
+            env.begin_evaluation_phase(history_steps)
+            initial_gap=float(env._initial_gap);final_gap=initial_gap
+            initial_rfv_speed=float(env._rfv_initial_speed);final_rfv_speed=initial_rfv_speed
         # Warm-up initializes temporal history; exclude it from interaction
         # response acceleration statistics.
         env._rfv_min_accel=0.
@@ -266,6 +286,18 @@ def collect_metadrive_expert(env, episodes, seed, callback=None):
             collision=bool(collisions),out_of_road=bool(offroad),seed=int(seed)+episode,scenario=env.scenario_type,
             warmup_steps=history_steps,minimum_future_steps=future_steps)
         validation=validate_expert_episode(raw,future_steps,history_steps)
+        from dataclasses import asdict
+        from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG, REFERENCE_FRAME_VERSION
+        raw['initial_interaction']=asdict(env.interaction_scenario)
+        raw['initial_variation_version']='gap-relative-speed-v1' if vary_initial_state else 'canonical'
+        raw['reference_frame_version']=REFERENCE_FRAME_VERSION
+        raw['road_geometry']=dict(ROAD_GEOMETRY_CONFIG)
+        raw['teacher_version']='curvature-feedback-v3'
+        raw['action_calibration_revision']=getattr(env.action_adapter,'calibration_revision',None)
+        raw['time_origin_version']='post-history-t0-v1'
+        raw['warmup_version']='curvature-feedback-20-frames-v1'
+        raw['split_version']='scenario_grouped_seed_70_15_15_v1'
+        raw['speed_config']={key:value for key,value in asdict(env.interaction_scenario).items() if key.endswith('_speed')}
         raw['validation']=validation
         raw['events']=events
         raw['quality_metrics']={'lane_change_success':task_success,'collision':bool(collisions),
@@ -289,6 +321,8 @@ def collect_metadrive_expert(env, episodes, seed, callback=None):
             delta_v_rfv_mps=final_rfv_speed-initial_rfv_speed,rfv_min_accel_mps2=rfv_min_accel))
         if callback and not callback(dict(state='running',step=episode+1,total=int(episodes),episodes=episode+1,
                 global_steps=len(transitions)//2,episode_steps=step,collision=bool(collisions),out_of_road=bool(offroad))):break
+    env.interaction_scenario=base_interaction
+    env.world.set_interaction_scenario(base_interaction)
     env._expert_collection=False
     return transitions,episode_rows,raw_episodes
 

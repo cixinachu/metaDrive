@@ -13,8 +13,11 @@ FUTURE_STEPS = 100
 
 def assign_episode_splits(metadata):
     """Split whole seeds independently within each MetaDrive road scenario."""
-    groups={}
+    groups={};seen=set()
     for row in metadata:
+        identity=(str(row.get('scenario','unknown')),int(row['seed']))
+        if identity in seen:raise ValueError(f'duplicate scenario episode seed: {identity}')
+        seen.add(identity)
         groups.setdefault(str(row.get('scenario','unknown')),set()).add(int(row['seed']))
     split_by_episode={}
     for scenario,seeds in groups.items():
@@ -82,7 +85,7 @@ def _validate_archive(data):
     return states, times, actions, state_offsets, action_offsets, metadata
 
 
-def native_dataset_info(path):
+def native_dataset_info(path, *, require_current=False):
     """Validate a reusable dataset and report available episode-level splits."""
     paths=[Path(item) for item in path] if isinstance(path,(list,tuple)) else [Path(path)]
     rows=[];window_counts=[]
@@ -90,11 +93,16 @@ def native_dataset_info(path):
         with np.load(source,allow_pickle=False) as archive:
             _states,_times,_actions,state_offsets,action_offsets,metadata=_validate_archive(archive)
             for index,row in enumerate(metadata):
-                start,end=state_offsets[index:index+2]
-                action_start,action_end=action_offsets[index:index+2]
+                start,end=map(int,state_offsets[index:index+2])
+                action_start,action_end=map(int,action_offsets[index:index+2])
                 history_steps=int(row.get('warmup_steps',HISTORY_STEPS))
                 n_windows=max(0,min(end-start-FUTURE_STEPS,
                     history_steps+(action_end-action_start)-FUTURE_STEPS+1)-history_steps)
+                if require_current:
+                    from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG, REFERENCE_FRAME_VERSION
+                    if (row.get('road_geometry') != ROAD_GEOMETRY_CONFIG or row.get('teacher_version') != 'curvature-feedback-v3'
+                            or row.get('reference_frame_version')!=REFERENCE_FRAME_VERSION):
+                        raise ValueError('expert episodes require recollection with current road geometry and teacher')
                 rows.append(row);window_counts.append(n_windows)
     assigned=assign_episode_splits(rows)
     windows=0;by_split={key:0 for key in ('train','validation','test')}
@@ -169,7 +177,10 @@ def load_native_windows(path, split="train"):
             for current in range(first, last_exclusive):
                 history_idx = np.arange(current - HISTORY_STEPS + 1, current + 1)
                 future_idx = np.arange(current + 1, current + FUTURE_STEPS + 1)
-                coords = _with_acceleration(_coordinates(raw, current))
+                # Use the same recorded scenario reference frame as the AIRL
+                # transitions and online environment, including on curved roads.
+                reference=np.asarray(archive["trajectory_reference_states_frenet"][ss:se],dtype=np.float64)
+                coords = _with_acceleration(reference)
                 history = coords[history_idx]
                 future = coords[future_idx]
                 action_start = current - history_steps

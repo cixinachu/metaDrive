@@ -123,6 +123,11 @@ class SRAIRLModelBundle:
             missing = required - set(metadata)
             if missing:
                 raise ValueError(f"{name} checkpoint lacks compatibility metadata: {sorted(missing)}")
+        from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG, REFERENCE_FRAME_VERSION
+        if any(meta.get('road_geometry_version') != ROAD_GEOMETRY_CONFIG['version'] for _,meta,_ in requirements):
+            raise ValueError('all model components require training on current road geometry')
+        if any(meta.get('reference_frame_version')!=REFERENCE_FRAME_VERSION for _,meta,_ in requirements):
+            raise ValueError('all model components require training on current shared reference frame')
         source_revisions={meta['source_dataset_revision'] for _,meta,_ in requirements}
         split_versions={meta['split_version'] for _,meta,_ in requirements}
         if len(source_revisions)!=1:
@@ -142,6 +147,10 @@ class SRAIRLModelBundle:
         if reward_dir.is_file():
             reward_dir = reward_dir.parent
         reward_config = json.loads((reward_dir / "config.json").read_text(encoding="utf-8"))
+        if reward_config.get('road_geometry') != ROAD_GEOMETRY_CONFIG:
+            raise ValueError('reward checkpoint requires training on current road geometry')
+        if reward_config.get('reference_frame_version')!=REFERENCE_FRAME_VERSION:
+            raise ValueError('reward checkpoint requires training on current shared reference frame')
         reward_settings = reward_config.get("srairl", {})
         if reward_config.get("reward_version")!="temporal-dynamic-v2" or reward_settings.get("frame_state_dim") != 16 or reward_settings.get("history_len") != 11:
             raise ValueError("SR-AIRL reward model must use 16D frames and history_len=11")
@@ -149,8 +158,15 @@ class SRAIRLModelBundle:
         if action_scale is None or action_scale>1.5+1e-8:
             raise ValueError("SR-AIRL policy action scale must remain inside the calibrated ±1.5 m/s² domain")
         reward_revision=reward_config.get("source_dataset_revision")
-        if reward_revision and reward_revision not in source_revisions:
+        if not reward_revision or reward_revision not in source_revisions:
             raise ValueError("SR-AIRL reward checkpoint uses a different MetaDrive source dataset revision")
+        from .provenance import checkpoint_set_revision
+        expected_reward=checkpoint_set_revision([reward_dir/'discriminator_elcv.pt',reward_dir/'discriminator_rfv.pt'],'temporal-dynamic-v2')
+        if guide_meta.get('reward_model_revision')!=expected_reward:
+            raise ValueError('Reward Guide was trained with a different reward checkpoint')
+        expected_guide=checkpoint_set_revision([paths[2]],'reward-guide-v1')
+        if predictor_meta.get('reward_guide_revision')!=expected_guide:
+            raise ValueError('Predictor was trained with a different Reward Guide checkpoint')
         planner_contract = {**planner_meta, "goal_architecture": goal_arch,
                             "planner_contract": {"transition_order": ["ax", "ay", "y", "x", "vx", "vy"],
                                                  "n_diffusion_steps": 20}}
@@ -158,8 +174,7 @@ class SRAIRLModelBundle:
                               "reward_guide_architecture": payloads[2].get("architecture", {}),
                               "predictor_architecture": payloads[3].get("architecture", {}),
                               "reward_guide_metadata": guide_meta}
-        # The reward discriminator intentionally comes from SR-AIRL training on
-        # expert transitions and may have a different expert-data revision.
+        # All stages must share the same source episode archive.
         return cls(Path(planner_goal_path), Path(planner_diffusion_path),
                    Path(reward_guide_path), Path(predictor_path), Path(reward_model_path),
                    planner_contract, predictor_contract,
@@ -175,11 +190,13 @@ class SRAIRLModelBundle:
         for key, entry in refs.items():
             if sha256(entry["path"]) != entry["sha256"]:
                 raise ValueError(f"checkpoint hash changed: {key}")
-        return cls(
-            Path(refs["planner_goal"]["path"]), Path(refs["planner"]["path"]),
-            Path(refs["reward_guide"]["path"]), Path(refs["predictor"]["path"]),
-            Path(refs["srairl_reward"]["path"]), manifest["planner_metadata"],
-            manifest["predictor_metadata"], manifest["normalization"],
+        # Rebuild compatibility from checkpoint bytes, never trust manifest metadata.
+        return cls.from_checkpoints(
+            planner_goal_path=refs['planner_goal']['path'],
+            planner_diffusion_path=refs['planner']['path'],
+            reward_guide_path=refs['reward_guide']['path'],
+            predictor_path=refs['predictor']['path'],
+            reward_model_path=refs['srairl_reward']['path'],
         )
 
 

@@ -8,6 +8,10 @@ import numpy as np
 
 @dataclass
 class EpisodeMetrics:
+    completion_time_s: float | None = None
+    controls: dict[str,list[dict]] = field(default_factory=dict)
+    failure_type: str | None = None
+    failure_details: list[dict] = field(default_factory=list)
     lane_change_success: bool = False
     time_to_lane_change_s: float | None = None
     collision: bool = False
@@ -28,11 +32,22 @@ class EpisodeMetrics:
     tracker_errors: dict[str, list[float]] = field(default_factory=dict)
 
     def update_environment(self, info):
-        self.lane_change_success = self.lane_change_success or bool(info.get("lane_change_success", False))
+        if info.get('time') is not None:self.completion_time_s=float(info['time'])
+        for role,control in info.get('control_telemetry',{}).items():
+            history=self.controls.setdefault(role,[])
+            if history and history[-1].get('time_s')==info.get('time'):continue
+            measured=np.asarray(control['measured_acceleration'],dtype=float)
+            jerk=None if not history else ((measured-np.asarray(history[-1]['measured_acceleration']))/float(info['dt_s'])).tolist()
+            history.append({**control,'time_s':info.get('time'),'jerk_mps3':jerk,
+                'steering_saturated':abs(control['metadrive_action'][0])>=.99,
+                'throttle_saturated':abs(control['metadrive_action'][1])>=.99})
+        self.lane_change_success = self.lane_change_success or bool(info.get("lane_change_success", info.get("merge_success", False)))
         if info.get("time_to_lane_change") is not None:
             self.time_to_lane_change_s = float(info["time_to_lane_change"])
         self.collision = self.collision or bool(info.get("metadrive_primary_collision", info.get("collision_proxy_any", False)))
         self.out_of_road = self.out_of_road or bool(info.get("metadrive_out_of_road", False))
+        if self.collision:self.failure_type='collision'
+        elif self.out_of_road:self.failure_type='out_of_road'
         for key, sources in (("minimum_ttc_s", ("minimum_ttc_s", "min_interaction_ttc_s", "controlled_ttc_s")),
                              ("minimum_distance_m", ("minimum_distance_m", "min_interaction_clearance_m",
                                                       "controlled_min_clearance_m"))):

@@ -4,7 +4,7 @@ from tasks.registry import TASK_REGISTRY
 
 def test_calibration_gate_requires_grid_and_held_out_for_both_axes():
     summary={'equivalence_status':'passed','metrics':{
-        axis:{split:{'passed':True} for split in ('calibration_grid','held_out')}
+        axis:{split:{'passed':True,'mae_mps2':.01,'max_error_mps2':.02,'wrong_sign_count':0} for split in ('calibration_grid','held_out')}
         for axis in ('longitudinal','lateral')}}
     assert action_calibration_passed(summary)
     summary['metrics']['lateral']['held_out']['passed']=False

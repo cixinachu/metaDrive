@@ -11,8 +11,10 @@ from metadrive.component.pg_space import BlockParameterSpace, Parameter, Paramet
 from metadrive.component.algorithm.blocks_prob_dist import PGBlockDistConfig
 
 
-CURVE_CENTER_RADIUS_M = 320.0
-RAMP_CENTER_RADIUS_M = 430.0
+from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG
+
+CURVE_CENTER_RADIUS_M = ROAD_GEOMETRY_CONFIG["curve_center_radius_m"]
+RAMP_CENTER_RADIUS_M = ROAD_GEOMETRY_CONFIG["ramp_center_radius_m"]
 
 
 class SRAIRLHighwayCurve(Curve):
@@ -26,6 +28,11 @@ class SRAIRLHighwayCurve(Curve):
 class SRAIRLHighwayRamp(InRampOnStraight):
     """MetaDrive merge block with a long, gradual native ramp transition."""
     RADIUS = RAMP_CENTER_RADIUS_M
+    PARAMETER_SPACE = ParameterSpace({
+        **BlockParameterSpace.RAMP_PARAMETER,
+        Parameter.length: ConstantSpace(ROAD_GEOMETRY_CONFIG['ramp_acceleration_length_m']),
+        Parameter.extension_length: ConstantSpace(ROAD_GEOMETRY_CONFIG['ramp_extension_length_m']),
+    })
 
 
 class SRAIRLBlockDistConfig(PGBlockDistConfig):
@@ -43,6 +50,9 @@ class _LaneSlice:
     def __init__(self, lane, start_s, end_s):
         self.lane=lane;self.start_s=float(start_s);self.length=max(0.,float(end_s)-self.start_s)
         self.index=lane.index;self.width=getattr(lane,"width",3.5)
+
+    def width_at(self,s):
+        return self.lane.width_at(self.start_s+float(s))
 
     def position(self,s,lateral=0.):
         return self.lane.position(self.start_s+float(s),lateral)
@@ -71,7 +81,7 @@ class _LaneTransition:
         c2=p1-np.asarray([np.cos(h1),np.sin(h1)])*(chord/3.)
         points=((1-t)**3)[:,None]*p0+3*((1-t)**2*t)[:,None]*c1+3*((1-t)*t**2)[:,None]*c2+(t**3)[:,None]*p1
         self._arc=np.concatenate(([0.],np.cumsum(np.linalg.norm(np.diff(points,axis=0),axis=1))))
-        self._arc_length=float(self._arc[-1]);self.length=float(target_s)-float(source_s);self._points=points
+        self._arc_length=float(self._arc[-1]);self.length=self._arc_length;self._points=points
         self._headings=np.unwrap(np.arctan2(np.gradient(points[:,1]),np.gradient(points[:,0])))
 
     def _sample(self,s):
@@ -79,6 +89,9 @@ class _LaneTransition:
         x=np.interp(distance,self._arc,self._points[:,0]);y=np.interp(distance,self._arc,self._points[:,1])
         heading=float(np.interp(distance,self._arc,self._headings))
         return np.asarray([x,y]),heading
+
+    def width_at(self,s):
+        return self.width
 
     def position(self,s,lateral=0.):
         point,heading=self._sample(s)
@@ -329,7 +342,6 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
 
     def set_interaction_scenario(self,scenario):
         """Update the next procedural reset's four-role initial geometry."""
-        if self.scenario_type=='merge':raise ValueError('NGSIM lane-change samples cannot initialize a ramp-merge map')
         self.interaction_scenario=scenario.validate(int(self.config['map_config']['lane_num']))
         from metadrive.component.pgblock.first_block import FirstPGBlock
         lane_prefix=(FirstPGBlock.NODE_1,FirstPGBlock.NODE_2)
@@ -337,6 +349,9 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
                                spawn_velocity=(scenario.elcv_speed,0.),spawn_velocity_car_frame=True),
                  'agent1':dict(spawn_lane_index=(*lane_prefix,scenario.target_lane),spawn_longitude=scenario.rfv_x,
                                spawn_velocity=(scenario.rfv_speed,0.),spawn_velocity_car_frame=True)}
+        if self.scenario_type=='merge':
+            updates['agent0'].update(spawn_lane_index=('1r1_2_','1r1_3_',0),spawn_longitude=4.+scenario.elcv_x-30.)
+            updates['agent1'].update(spawn_lane_index=('>>>','1r0_0_',2),spawn_longitude=60.+scenario.rfv_x-15.)
         for agent_id,values in updates.items():self.config['agent_configs'][agent_id].update(values)
         self._active_spawn_updates=updates
         self._apply_interaction_scenario_to_engine()
@@ -403,7 +418,7 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         return path
 
     @staticmethod
-    def _compose_merge_reference_path(ramp_path,mainline_path,transition_length=24.):
+    def _compose_merge_reference_path(ramp_path,mainline_path,transition_length=ROAD_GEOMETRY_CONFIG["merge_transition_length_m"]):
         """Join the taper-ending ramp lane to its adjacent mainline lane smoothly."""
         if len(ramp_path)<1 or len(mainline_path)<2:
             raise RuntimeError("MetaDrive merge map is missing its ramp or mainline lanes")
@@ -438,7 +453,16 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         current_leader_s=ego_path_s+max(12.,self.interaction_scenario.rlv_current_x-
                                              self.interaction_scenario.elcv_x)
         rfv=self.role_vehicle('rfv')
-        rfv_path_s=self._path_distance(mainline,rfv.position[:2])
+        # Align the real target-lane gap with the ramp actor's physical
+        # projection. Fixed mainline spawn s=60 ceases to describe that gap
+        # when the highway ramp radius/length changes.
+        ego_mainline_s=self._path_distance(mainline,ego.position[:2])
+        rfv_path_s=ego_mainline_s-(self.interaction_scenario.elcv_x-self.interaction_scenario.rfv_x)
+        rfv_lane,rfv_local=self._path_position(mainline,rfv_path_s)
+        rfv_heading=float(rfv_lane.heading_theta_at(rfv_local))
+        rfv.set_position(rfv_lane.position(rfv_local,0.))
+        rfv.set_heading_theta(rfv_heading)
+        rfv.set_velocity(np.asarray([np.cos(rfv_heading),np.sin(rfv_heading)])*self.interaction_scenario.rfv_speed)
         mainline_offset=rfv_path_s-float(self.interaction_scenario.rfv_x)
         # Keep the current-lane leader on the same continuous ramp-to-mainline
         # route as ELCV; the target-lane leader and RFV share the mainline.

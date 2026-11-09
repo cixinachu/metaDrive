@@ -37,14 +37,21 @@ class SRAIRLTrajectoryTracker:
         velocity = np.asarray(vehicle.velocity[:2], dtype=float)
         return np.asarray([longitudinal, -lateral, velocity @ tangent, velocity @ normal], dtype=float)
 
-    def desired_acceleration(self, current_state, target_state):
+    @staticmethod
+    def path_curvature(lane,s):
+        lo=max(0.,float(s)-.5);hi=min(float(lane.length),float(s)+.5)
+        if hi<=lo:return 0.
+        delta=(lane.heading_theta_at(hi)-lane.heading_theta_at(lo)+np.pi)%(2*np.pi)-np.pi
+        return float(delta/(hi-lo))
+
+    def desired_acceleration(self, current_state, target_state, *, curvature=0.):
         current = np.asarray(current_state, dtype=float)
         target = np.asarray(target_state, dtype=float)
         if current.shape != (4,) or target.shape != (4,) or not np.isfinite(current).all() or not np.isfinite(target).all():
             raise ValueError("current and target lane states must be finite [s, d, v_s, v_d]")
         g = self.gains
         longitudinal = g.longitudinal_position * (target[0] - current[0]) + g.longitudinal_speed * (target[2] - current[2])
-        lateral = g.lateral_position * (target[1] - current[1]) + g.lateral_speed * (target[3] - current[3])
+        lateral = float(target[2])**2*float(curvature) + g.lateral_position * (target[1] - current[1]) + g.lateral_speed * (target[3] - current[3])
         return np.asarray([
             np.clip(longitudinal, g.min_longitudinal_accel, g.max_longitudinal_accel),
             np.clip(lateral, -g.max_lateral_accel, g.max_lateral_accel),

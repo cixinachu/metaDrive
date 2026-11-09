@@ -18,6 +18,7 @@ class SRAIRLActionAdapter:
         if min(self.wheelbase_m, self.max_steering_angle_rad,
                self.throttle_accel_mps2, self.brake_accel_mps2) <= 0:
             raise ValueError("vehicle control scales must be positive")
+        self.calibration_revision = None
         self.calibration = None
 
     def load_calibration(self, path):
@@ -32,6 +33,8 @@ class SRAIRLActionAdapter:
             missing=required-set(self.calibration)
             self.calibration = None
             raise ValueError(f"calibration file is missing {sorted(missing)}")
+        import hashlib
+        self.calibration_revision=hashlib.sha256(path.read_bytes()).hexdigest()
         return True
 
     @classmethod

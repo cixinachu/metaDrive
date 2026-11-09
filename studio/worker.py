@@ -35,12 +35,7 @@ def _upstream_subprocess_env():
     return environment
 
 
-def action_calibration_passed(summary):
-    if not isinstance(summary,dict) or summary.get('equivalence_status')!='passed':return False
-    metrics=summary.get('metrics',{})
-    return all(metrics.get(axis,{}).get(split,{}).get('passed') is True
-               for axis in ('longitudinal','lateral')
-               for split in ('calibration_grid','held_out'))
+from env.adapters.srairl_calibration import action_calibration_passed, calibration_summary_path
 
 
 def srairl_experiment_protocol(settings,calibration_passed=False):
@@ -377,6 +372,8 @@ def materialize_metadrive_dataset(directory, dataset_ids):
     if not ids:
         raise ValueError('select at least one MetaDrive expert dataset')
     paths=[(ROOT/item).resolve() for item in ids]
+    from datasets.srairl.native_windows import native_dataset_info
+    native_dataset_info(paths,require_current=True)
     paths=sorted(paths,key=lambda path:hashlib.sha256(path.read_bytes()).hexdigest())
     if len(paths)==1:
         return paths[0]
@@ -396,13 +393,7 @@ def metadrive_source_revision(dataset_ids):
     return digest.hexdigest()
 
 
-def checkpoint_set_revision(paths, namespace):
-    digest=hashlib.sha256(str(namespace).encode('utf-8'))
-    for path in sorted((Path(item).resolve() for item in paths),key=lambda item:item.name):
-        if not path.is_file():raise FileNotFoundError(path)
-        digest.update(path.name.encode('utf-8'))
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
-    return digest.hexdigest()
+from rl.srairl.pipeline.provenance import checkpoint_set_revision
 
 
 def srairl_reward_revision(directory):
@@ -640,7 +631,7 @@ def collect_srairl_expert(directory,c):
                     atomic_json(directory/'status.json',state)
                     return not (directory/'STOP').exists()
                 current_transitions,current_episodes,current_raw=collect_metadrive_expert(
-                    env,c['demo_episodes'],(c['seed']+scenario_index*100_000)%(2**32),report)
+                    env,c['demo_episodes'],(c['seed']+scenario_index*100_000)%(2**32),report,vary_initial_state=True)
                 transitions.extend(current_transitions);episodes.extend(current_episodes);raw_episodes.extend(current_raw)
             finally:env.close()
         accepted_raw=[]
@@ -662,7 +653,7 @@ def collect_srairl_expert(directory,c):
             interaction_scenario=c.get('interaction_scenario'),
             state_definition='SRAIRLObservationAdapter 16D frame stacked HISTORY_LEN times; action=[longitudinal_acceleration,lateral_acceleration] in m/s^2',
             dynamics_mode='metadrive_physics',background_traffic='MetaDrive IDM traffic manager',
-            trajectory_definition='Global world coordinates [x,y,vx,vy] for ELCV, RFV, RLV_current, RLV_target; 20 real IDM history frames and at least 100 real future frames after completed lane change',
+            trajectory_definition='Global world coordinates [x,y,vx,vy] for ELCV, RFV, RLV_current, RLV_target; 20 real lane-tracking history frames and at least 100 real future frames after completed lane change',
             action_channels='desired physical acceleration [a_long,a_lat], normalized MetaDrive [steering,throttle_brake], measured physical [a_long,a_lat]',
             calibrated_desired_acceleration_domain_mps2={'longitudinal':[-1.5,1.5],'lateral':[-1.5,1.5]},
             interaction_template='ELCV moves from source lane into the gap between RFV and RLV_target; RFV follows its leader and may respond'),
@@ -761,9 +752,9 @@ def evaluate_srairl_procedural(directory,c,env,policies,training):
                 'evaluation/delta_v_rfv_mps':float(row['delta_v_rfv_mps']),
                 **({'evaluation/minimum_distance_m':row['minimum_distance_m']} if row['minimum_distance_m'] is not None else {}),
                 **({'evaluation/minimum_ttc_s':row['minimum_ttc_s']} if row['minimum_ttc_s'] is not None else {})},step=steps)
-        calibration_path=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json'
+        calibration_path=calibration_summary_path()
         calibration=json.loads(calibration_path.read_text()) if calibration_path.is_file() else None
-        calibration_passed=action_calibration_passed(calibration)
+        calibration_passed=action_calibration_passed(calibration,require_closed_loop=True)
         protocol=srairl_experiment_protocol(c,calibration_passed)
         summary=dict(algorithm='SR-AIRL',episodes=int(completed),global_steps=steps,
             scene_source='procedural',scenario=c['scenario'],lane_num=c['lane_num'],traffic_density=c['traffic_density'],
@@ -882,9 +873,9 @@ def evaluate_srairl(directory,c):
                             'evaluation/metadrive_out_of_road_rate':float(metadrive_out_of_road),
                             'evaluation/success_rate':float(row['success'])},step=steps)
             if row['minimum_ttc_s'] is not None:recorder.write({'evaluation/minimum_ttc_s':row['minimum_ttc_s']},step=steps)
-        calibration_path=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json'
+        calibration_path=calibration_summary_path()
         calibration=json.loads(calibration_path.read_text()) if calibration_path.is_file() else None
-        calibration_passed=action_calibration_passed(calibration)
+        calibration_passed=action_calibration_passed(calibration,require_closed_loop=True)
         physics_mode=c.get('dynamics_mode')=='metadrive_physics'
         protocol=srairl_experiment_protocol(c,calibration_passed)
         summary=dict(algorithm='SR-AIRL',episodes=len(episode_rows),global_steps=steps,
@@ -917,6 +908,10 @@ def evaluate_srairl(directory,c):
 
 
 def train_reward_guide(directory, c):
+    from env.tasks.srairl_interaction import REFERENCE_FRAME_VERSION
+    reward_config=json.loads((Path(c['srairl_model_path'])/'config.json').read_text())
+    if reward_config.get('reference_frame_version')!=REFERENCE_FRAME_VERSION or reward_config.get('source_dataset_revision')!=metadrive_source_revision(c['dataset_id']):
+        raise ValueError('Reward Guide requires a reward model trained on the same current MetaDrive dataset/frame')
     stage = ROOT/'rl/srairl/upstream/Step3_Reward_Guide'
     device = c['device']
     if device == 'auto':
@@ -944,6 +939,11 @@ def train_reward_guide(directory, c):
 
 
 def train_srairl_predictor(directory, c):
+    from rl.srairl.pipeline.model_bundle import torch_load_metadata
+    from env.tasks.srairl_interaction import REFERENCE_FRAME_VERSION
+    guide_meta=torch_load_metadata(c['reward_guide_path']).get('metadata',{})
+    if guide_meta.get('reference_frame_version')!=REFERENCE_FRAME_VERSION or guide_meta.get('source_dataset_revision')!=metadrive_source_revision(c['dataset_id']):
+        raise ValueError('Predictor requires a guide trained on the same current MetaDrive dataset/frame')
     stage = ROOT/'rl/srairl/upstream/Step4_Predictor'
     device = c['device']
     if device == 'auto':
@@ -1026,7 +1026,7 @@ def write_upstream_runtime_metadata(directory, task, c, device):
         try:versions[package]=importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:versions[package]=None
     from datasets.srairl.native_windows import native_dataset_info
-    dataset_info=native_dataset_info(dataset)
+    dataset_info=native_dataset_info(dataset,require_current=True)
     source_revision=metadrive_source_revision(c['dataset_id'])
     split_version=dataset_info['split_protocol']
     component_revision=hashlib.sha256((source_revision+':'+task+':'+split_version+':native-window-v1').encode()).hexdigest()
@@ -1043,6 +1043,8 @@ def write_upstream_runtime_metadata(directory, task, c, device):
             'episodes':dataset_info['episodes'],'windows':dataset_info['windows'],
             'windows_by_split':dataset_info['windows_by_split'],'split_protocol':dataset_info['split_protocol'],
             'validation_note':'Whole MetaDrive episodes are assigned to train/validation/test before windows are constructed.'},
+        'reference_frame_version':__import__('env.tasks.srairl_interaction',fromlist=['REFERENCE_FRAME_VERSION']).REFERENCE_FRAME_VERSION,
+        'road_geometry_version':__import__('env.tasks.srairl_interaction',fromlist=['ROAD_GEOMETRY_CONFIG']).ROAD_GEOMETRY_CONFIG['version'],
         'source_dataset_revision':source_revision,'component_dataset_revision':component_revision,
         'dataset_revision':source_revision,'split_version':split_version,
         **dependency_revisions,
@@ -1057,7 +1059,7 @@ def write_upstream_runtime_metadata(directory, task, c, device):
         relative_parent=checkpoint_file.parent.relative_to(directory)
         checkpoint_component=relative_parent.as_posix() if str(relative_parent)!='.' else task
         checkpoint_revision=hashlib.sha256((source_revision+':'+task+':'+checkpoint_component+':'+split_version+':native-window-v1').encode()).hexdigest()
-        payload['metadata'].update(source_dataset_revision=source_revision,
+        payload['metadata'].update(reference_frame_version=metadata['reference_frame_version'],road_geometry_version=metadata['road_geometry_version'],source_dataset_revision=source_revision,
             component_dataset_revision=checkpoint_revision,dataset_revision=source_revision,
             split_version=split_version,component_name=checkpoint_component,**dependency_revisions)
         torch.save(payload,checkpoint_file)
@@ -1085,7 +1087,7 @@ def main():
             atomic_json(directory/'model_bundle.json',bundle.to_manifest())
             task=InteractionEvaluationTask(
                 model_bundle=bundle,
-                calibration_summary=ROOT/'outputs/calibration/srairl_action_adapter_v2/summary.json',
+                calibration_summary=calibration_summary_path(),
                 device=('cuda' if c.get('srairl_device')=='auto' and torch.cuda.is_available() else
                         'cpu' if c.get('srairl_device')=='auto' else c.get('srairl_device')),
                 candidate_count=c['candidate_count'],
@@ -1134,6 +1136,11 @@ def main():
                 'episodes':len(all_metrics),'candidate_count':c['candidate_count'],
                 'replan_steps':c['replan_steps'],'seed':c['seed'],'model_bundle_id':c['model_bundle_id'],
                 'metrics':all_metrics,'calibration_hash':task.calibration_hash,
+                'success_rate':float(np.mean([r['lane_change_success'] for r in all_metrics])),
+                'collision_rate':float(np.mean([r['collision'] for r in all_metrics])),
+                'out_of_road_rate':float(np.mean([r['out_of_road'] for r in all_metrics])),
+                'failure_counts':{name:sum(r.get('failure_type')==name for r in all_metrics)
+                    for name in ('model_candidates_infeasible','tracker_failure','collision','out_of_road')},
                 'test_note':'Each generated seed is evaluated once; scenes are not independent if they share a source recording.'}
             atomic_json(directory/'summary.json',summary)
             atomic_json(directory/'status.json',dict(state='completed',kind='eval',step=c['episodes'],

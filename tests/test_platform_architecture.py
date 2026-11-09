@@ -212,7 +212,7 @@ def _native_component_archive(tmp_path, monkeypatch):
         trajectory_lane_indices=np.full((n*episodes,4),'main/road/0',dtype='U32'),
         trajectory_action_offsets=np.arange(episodes+1)*100,
         trajectory_metadata=np.asarray(json.dumps([dict(seed=100+i,scenario='straight',warmup_steps=20,
-            split=split) for i,split in enumerate(('train','validation','test'))])))
+            split=split,road_geometry=__import__('env.tasks.srairl_interaction',fromlist=['ROAD_GEOMETRY_CONFIG']).ROAD_GEOMETRY_CONFIG,teacher_version='curvature-feedback-v3',reference_frame_version='scenario-left-normal-v2') for i,split in enumerate(('train','validation','test'))])))
     return 'datasets/srairl/metadrive/native.npz'
 
 

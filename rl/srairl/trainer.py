@@ -56,13 +56,16 @@ class SRAIRLTrainingConfig:
     discriminator_batch_size: int = 64
     discriminator_updates: int = 10
     lambda_social: float = 0.0
-    lambda_equilibrium: float = 0.01
+    lambda_equilibrium: float = 0.0
+    discriminator_label_smoothing: float = 0.0
     lambda_rank: float = defaults.RANK_LAMBDA
     preference_margin: float = 0.01
     seed: int = defaults.SEED
     device: str = "auto"
 
     def __post_init__(self):
+        if not 0 <= self.discriminator_label_smoothing < 0.5:
+            raise ValueError('discriminator_label_smoothing must be in [0, 0.5)')
         if self.episodes < 1 or self.action_scale <= 0 or self.ppo_epochs < 1:
             raise ValueError("episodes/action_scale/ppo_epochs must be positive")
         if self.discriminator_every_episodes < 1 or self.discriminator_batch_size < 2 or self.discriminator_updates < 1:
@@ -212,10 +215,10 @@ class SRAIRLTrainer:
                 gen_f["states"], gen_f["dones"], gen_f["logprobs"], gen_f["next_states"])
             logits_exp_f = self.discriminator_rfv.discriminator_logits(
                 exp["states"], exp["dones"], log_exp_f, exp["next_states"])
-            loss = self.bce(logits_exp_e, torch.full_like(logits_exp_e,.9))
-            loss += self.bce(logits_exp_f, torch.full_like(logits_exp_f,.9))
-            loss += self.bce(logits_gen_e, torch.full_like(logits_gen_e,.1))
-            loss += self.bce(logits_gen_f, torch.full_like(logits_gen_f,.1))
+            loss = self.bce(logits_exp_e, torch.full_like(logits_exp_e,1.-d.discriminator_label_smoothing))
+            loss += self.bce(logits_exp_f, torch.full_like(logits_exp_f,1.-d.discriminator_label_smoothing))
+            loss += self.bce(logits_gen_e, torch.full_like(logits_gen_e,d.discriminator_label_smoothing))
+            loss += self.bce(logits_gen_f, torch.full_like(logits_gen_f,d.discriminator_label_smoothing))
             social = loss.new_zeros(()); equilibrium = loss.new_zeros(()); rank = loss.new_zeros(())
             if d.lambda_social > 0:
                 _, private_e, _ = self.discriminator_elcv.get_reward(exp["states"])
@@ -294,8 +297,13 @@ class SRAIRLTrainer:
             "seed": self.train_config.seed,
         }, directory / "training_state.pt")
         (directory / "config.json").write_text(json.dumps({"algorithm": "SR-AIRL", "reward_version":"temporal-dynamic-v2",
+            "source_dataset_revision":getattr(self,"source_dataset_revision",None),
+            "reference_frame_version":__import__("env.tasks.srairl_interaction",fromlist=["REFERENCE_FRAME_VERSION"]).REFERENCE_FRAME_VERSION,
+            "road_geometry": __import__("env.tasks.srairl_interaction",fromlist=["ROAD_GEOMETRY_CONFIG"]).ROAD_GEOMETRY_CONFIG if self.dynamics_mode=="metadrive_physics" else None,
             "srairl": self.config.__dict__,
             "training": self.train_config.__dict__, "episode": self.episode, "global_steps": self.global_steps,
+            "scene_source":"procedural" if self.dynamics_mode=="metadrive_physics" else "legacy",
+            "training_scenarios":sorted({getattr(env,"scenario_type","unknown") for env in self.envs}),
             "dynamics_mode":self.dynamics_mode,
             "reactive_background":bool(getattr(getattr(getattr(self.envs[0].world,"engine",None),"traffic_manager",None),"reactive",False)) if self.envs else False}, indent=2))
 
@@ -310,6 +318,14 @@ class SRAIRLTrainer:
         dynamics = metadata.get("dynamics_mode")
         if dynamics != self.dynamics_mode:
             raise ValueError("checkpoint dynamics mode does not match the current environment")
+        if self.dynamics_mode=='metadrive_physics':
+            from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG, REFERENCE_FRAME_VERSION
+            if metadata.get('road_geometry')!=ROAD_GEOMETRY_CONFIG or metadata.get('reference_frame_version')!=REFERENCE_FRAME_VERSION:
+                raise ValueError('checkpoint road/reference frame requires recollection and retraining')
+        expected_revision=getattr(self,'source_dataset_revision',None)
+        if expected_revision and expected_revision!=metadata.get('source_dataset_revision'):
+            raise ValueError('checkpoint source dataset does not match the current run')
+        self.source_dataset_revision=metadata.get('source_dataset_revision')
         self.policy_elcv.load(directory / "policy_elcv.pt")
         self.policy_rfv.load(directory / "policy_rfv.pt")
         self.discriminator_elcv.load_state_dict(torch.load(
@@ -348,9 +364,13 @@ class SRAIRLTrainer:
 
     def train(self, callback=None):
         history = []
+        active_env = None
         for episode in range(self.episode, self.train_config.episodes):
             if self.env_factory is None:
                 env=self.envs[episode % len(self.envs)]
+                if active_env is not None and active_env is not env and self.dynamics_mode=='metadrive_physics':
+                    active_env.close()
+                active_env=env
                 tracking_return = self._collect_episode(env)
             else:
                 env=self.env_factory(episode)

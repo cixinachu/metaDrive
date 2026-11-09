@@ -33,7 +33,8 @@ class InteractionEvaluationTask:
             raise FileNotFoundError(f"action calibration summary missing: {self.calibration_summary}")
         self.calibration_hash = sha256(self.calibration_summary)
         data = json.loads(self.calibration_summary.read_text(encoding="utf-8"))
-        if data.get("equivalence_status") != "passed" or not data.get("physics_evaluation_allowed", True):
+        from env.adapters.srairl_calibration import action_calibration_passed
+        if not action_calibration_passed(data,require_closed_loop=True):
             raise ValueError("closed-loop evaluation requires passed Action Adapter calibration")
         limits = data.get("validated_acceleration_domain", {})
         ax = limits.get("ax_mps2", [-1.5, 1.5])
@@ -61,66 +62,34 @@ class InteractionEvaluationTask:
             max_lateral_accel=float(max(abs(v) for v in self.selector_domain[1]))))
 
         def lane_check(role, states):
-            source = getattr(env, "_source_lane", None)
-            target = getattr(env, "_target_lane", source)
-            if source is None:
-                return False
-            if getattr(env, "scenario_type", None) == "merge":
-                paths = getattr(env.world, "_interaction_paths", {})
-                allowed_list = []
-                for role_path in ("rlv_current", "rlv_target"):
-                    for lane in paths.get(role_path, ((), 0., 0.))[0]:
-                        if not any(lane is existing for existing in allowed_list):
-                            allowed_list.append(lane)
-                allowed = tuple(allowed_list) or (source, target)
-            else:
-                allowed = (source, target)
-            for y, x, vx, vy in np.asarray(states):
-                if getattr(env, "scenario_type", None) == "merge":
-                    point = np.asarray([x, y], dtype=float)
-                else:
-                    point = np.asarray(source.position(float(x), float(y)), dtype=float)[:2]
-                if not any(abs(float(lane.local_coordinates(point)[1])) <= float(lane.width_at(0)) * 0.5
-                           for lane in allowed):
-                    return False
-            if role == "elcv":
-                y, x = np.asarray(states[-1])[:2]
-                point = np.asarray([x, y], dtype=float) if getattr(env, "scenario_type", None) == "merge" \
-                    else np.asarray(source.position(float(x), float(y)), dtype=float)[:2]
-                if abs(float(target.local_coordinates(point)[1])) > float(target.width_at(0)) * 0.5:
-                    return False
+            for state in np.asarray(states):
+                point=env.reference_to_world(role,state)[:2]
+                if not any(0<=lane.local_coordinates(point)[0]<=lane.length and
+                           abs(lane.local_coordinates(point)[1])<=lane.width_at(0)*.5
+                           for lane in env._native_drivable_lanes):return False
+            if role=='elcv':
+                point=env.reference_to_world(role,states[-1])[:2]
+                target_path=env._merge_mainline_path if env._is_merge else env._target_lane_path
+                if not any(0<=lane.local_coordinates(point)[0]<=lane.length and
+                           abs(lane.local_coordinates(point)[1])<=lane.width_at(0)*.5 for lane in target_path):return False
             return True
 
         def map_to_tracker(role, state, current_env):
-            if getattr(current_env, "scenario_type", None) == "merge":
-                vehicle = current_env.world.role_vehicle(role)
-                return upstream_to_lane_state(state, vehicle.lane)
-            # Straight/curve role states share the source lane's local frame.
-            y, x, vx, vy = np.asarray(state, dtype=float)
-            return np.asarray([x, -y, vx, vy])
+            world=current_env.reference_to_world(role,state)
+            return upstream_to_lane_state(np.asarray([world[1],world[0],world[2],world[3]]),
+                                          current_env.world.role_vehicle(role).lane)
 
         def planning_context(current_env, history):
             ego = current_env.world.role_vehicle("elcv")
             if getattr(current_env, "scenario_type", None) == "merge":
-                paths = getattr(current_env.world, "_interaction_paths", {})
-                target_path = paths.get("rlv_target", (None, 0., 0.))[0]
-                if not target_path:
-                    raise RuntimeError("merge target-lane geometry is unavailable")
-                speed = max(1.0, float(np.linalg.norm(ego.velocity[:2])))
-                desired_x = float(ego.position[0]) + speed * 10.0
-                points = []
-                for lane in target_path:
-                    samples = np.linspace(0.0, float(lane.length), max(2, int(lane.length / 2.0) + 1))
-                    points.extend(np.asarray(lane.position(float(s), 0.0), dtype=float)[:2]
-                                  for s in samples)
-                target_point = min(points, key=lambda point: abs(float(point[0]) - desired_x))
-                target_y = float(target_point[1])
+                target_y=0.0
             else:
                 source = current_env._source_lane
                 target = current_env._target_lane
                 source_s, _ = source.local_coordinates(ego.position[:2])
                 target_center = target.position(float(source_s), 0.0)
                 _, target_y = source.local_coordinates(np.asarray(target_center, dtype=float)[:2])
+                target_y=-target_y
             return PlanningContext(target_lateral_position=float(target_y), target_lateral_velocity=0.0)
 
         pipeline = SRAIRLClosedLoopPipeline(
@@ -131,6 +100,9 @@ class InteractionEvaluationTask:
             planning_context_provider=planning_context,
         )
         pipeline.selector.lane_check = lane_check
+        pipeline.selector.world_state_mapper=lambda role,states:np.asarray([env.reference_to_world(role,s) for s in states])
+        pipeline.selector.shape_provider=lambda role:(env.world.role_vehicle(role).LENGTH,env.world.role_vehicle(role).WIDTH)
+        pipeline.selector.position_mapper=lambda role,states:np.asarray([env.reference_to_world(role,s)[:2] for s in states])
         video = None
         old_callback = getattr(env, "frame_callback", None)
         if output_path:

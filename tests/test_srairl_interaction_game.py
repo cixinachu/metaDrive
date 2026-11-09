@@ -121,7 +121,7 @@ def test_scripted_yield_and_gap_closing_change_lane_change_outcome():
 
 def test_metadrive_ramp_and_mainline_share_conflict_route_and_no_false_merge_success():
     from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
-    env=SRAIRLProceduralEnv('merge',3,0.,seed=4,horizon=100)
+    env=SRAIRLProceduralEnv('merge',3,0.,seed=4,horizon=300)
     try:
         env.reset(seed=4);world=env.world;ego=world.role_vehicle('elcv');rfv=world.role_vehicle('rfv')
         assert ego.lane_index[0].startswith('1r1_')
@@ -129,7 +129,7 @@ def test_metadrive_ramp_and_mainline_share_conflict_route_and_no_false_merge_suc
         assert ego.navigation.final_lane is rfv.navigation.final_lane
         assert '1r0_0_' in world.current_map.road_network.graph['1r1_3_']
         assert '1r0_0_' in world.current_map.road_network.graph['>>>']
-        for _ in range(100):
+        for _ in range(300):
             actions={role:env._to_metadrive_action(world.role_vehicle(role),np.zeros(2)) for role in ('elcv','rfv')}
             _,info=env.step(actions)
             if info['done']:break
@@ -146,7 +146,7 @@ def test_metadrive_ramp_and_mainline_share_conflict_route_and_no_false_merge_suc
             from datasets.srairl.metadrive_expert import MetaDriveExpertController
             env.rfv_response='fixed_speed';env.reset(seed=4)
             teacher=MetaDriveExpertController(env)
-            for _ in range(100):
+            for _ in range(300):
                 _,info=env.step({role:teacher.action(role) for role in ('elcv','rfv')})
                 if info['done']:break
             assert info['merge_success']

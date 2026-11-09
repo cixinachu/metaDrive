@@ -1,14 +1,4 @@
-"""Train SR-AIRL from explicitly role-mapped canonical NGSIM clips.
-
-Scenario manifest schema:
-{
-  "scenarios": [{"dataset_id":"<24-hex-id>", "roles": {
-    "elcv_id":"<track-id>", "rfv_id":"<track-id>",
-    "rlv_current_id":"<track-id>", "rlv_target_id":"<track-id>"}}
-  ]
-}
-Only training-split clips are accepted. Role mappings are mandatory.
-"""
+"""Train SR-AIRL on current native four-vehicle MetaDrive expert archives."""
 import argparse
 import json
 from pathlib import Path
@@ -55,17 +45,45 @@ def build_training_inputs(path, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scenarios", required=True, type=Path, help="JSON with clip IDs and explicit ELCV/RFV/leader IDs")
+    parser.add_argument("--expert-archives", required=True, nargs="+", type=Path, help="Current native MetaDrive expert archives")
     parser.add_argument("--output", type=Path, default=ROOT / "models" / "srairl")
-    parser.add_argument("--episodes", type=int, default=110001)
+    parser.add_argument("--episodes", type=int, default=15000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument('--ppo-epochs',type=int,default=80)
+    parser.add_argument('--discriminator-every',type=int,default=150)
     args = parser.parse_args(argv)
     config = SRAIRLConfig.from_mapping()
-    scenarios, expert = build_training_inputs(args.scenarios, config)
-    training = SRAIRLTrainingConfig(episodes=args.episodes, seed=args.seed, device=args.device)
+    from datasets.srairl.expert_builder import load_transitions
+    from datasets.srairl.native_windows import native_dataset_info
+    from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+    from env.tasks.srairl_interaction import SRAIRLInteractionScenario
+    native_dataset_info(args.expert_archives,require_current=True)
+    expert=[];scenarios=[];seen_scenes=set()
+    for path in args.expert_archives:
+        rows, metadata=load_transitions(path,split='train')
+        expert.extend(rows)
+        for scene in metadata.get('scenarios') or [metadata.get('scenario')]:
+            if scene not in ('straight','curve','merge'):raise ValueError('archive has no supported MetaDrive scenario')
+            if scene in seen_scenes:continue
+            seen_scenes.add(scene)
+            scenarios.append(SRAIRLProceduralEnv(scene,lane_num=3,
+                traffic_density=float(metadata.get('traffic_density_by_scenario',{}).get(scene,metadata.get('traffic_density',0))),
+                seed=args.seed,horizon=1000))
+    if args.output.exists():
+        raise ValueError('output directory already exists; choose a new run directory')
+    training = SRAIRLTrainingConfig(episodes=args.episodes, seed=args.seed, device=args.device,
+        ppo_epochs=args.ppo_epochs,discriminator_every_episodes=args.discriminator_every)
     trainer = SRAIRLTrainer(scenarios, expert, config=config, training_config=training, output_dir=args.output)
-    history = trainer.train(callback=lambda row: print(json.dumps(row, ensure_ascii=False, allow_nan=False), flush=True))
+    import hashlib
+    digest=hashlib.sha256()
+    for path in sorted(args.expert_archives,key=lambda item:item.name):
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode('ascii'))
+    trainer.source_dataset_revision=digest.hexdigest()
+    try:
+        history = trainer.train(callback=lambda row: print(json.dumps(row, ensure_ascii=False, allow_nan=False), flush=True))
+    finally:
+        for env in scenarios:env.close()
     print(f"Training finished: episodes={trainer.episode}, checkpoints={args.output}")
 
 

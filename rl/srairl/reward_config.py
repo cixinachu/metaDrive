@@ -20,8 +20,8 @@ POS_LONG_SCALE = 500.0
 VEL_SCALE = 80.0
 VEL_OFFSET = -40.0
 
-# The public airl.py imports reward_config.py, which is absent from the public
-# upstream tree. These explicit study values were supplied for this run.
+# Verified against upstream be71aade7acff6455fffc8f1143953ac72bdbca6
+# Step1_Reward_Recovery/reward_config.py on 2026-11-09.
 DT = 0.1
 VEL_MIN = VEL_OFFSET
 ACC_SCALE = 10.0
@@ -35,5 +35,5 @@ RANK_TEMPERATURE = 0.1
 RANK_BATCH_SIZE = 16
 RANK_WINDOW = 20
 
-MAX_EPISODES = 100000
+MAX_EPISODES = 15000
 SEED = 42

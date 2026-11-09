@@ -5,6 +5,29 @@ import torch
 from .normalization import RewardPredictorNormalizer
 
 
+def vehicle_footprints_overlap(first,second,first_shape,second_shape):
+    """Separating-axis test for synchronous physical oriented rectangles."""
+    first=np.asarray(first,dtype=float);second=np.asarray(second,dtype=float)
+    headings=[np.arctan2(states[:,3],states[:,2]) for states in (first,second)]
+    tangents=[np.stack((np.cos(h),np.sin(h)),axis=-1) for h in headings]
+    normals=[np.stack((-t[:,1],t[:,0]),axis=-1) for t in tangents]
+    separation=second[:,:2]-first[:,:2]
+    overlap=np.ones(len(first),dtype=bool)
+    for axis in (tangents[0],normals[0],tangents[1],normals[1]):
+        extent=[]
+        for tangent,normal,shape in zip(tangents,normals,(first_shape,second_shape)):
+            extent.append(.5*(shape[0]*np.abs(np.sum(tangent*axis,axis=-1))+
+                               shape[1]*np.abs(np.sum(normal*axis,axis=-1))))
+        overlap &= np.abs(np.sum(separation*axis,axis=-1))<=extent[0]+extent[1]
+    return overlap
+
+
+class CandidateFeasibilityError(RuntimeError):
+    def __init__(self, diagnostics):
+        super().__init__('all joint candidates failed hard feasibility checks')
+        self.diagnostics=diagnostics
+
+
 class CandidateSelector:
     def __init__(self, elcv_discriminator, rfv_discriminator, *, gamma=0.99,
                  validated_ax=(-1.5, 1.5), validated_ay=(-1.5, 1.5),
@@ -15,6 +38,9 @@ class CandidateSelector:
         self.validated_ax = tuple(validated_ax)
         self.validated_ay = tuple(validated_ay)
         self.lane_check = lane_check
+        self.position_mapper=None
+        self.world_state_mapper=None
+        self.shape_provider=None
         self.overlap_distance = float(overlap_distance)
         if not 0 < self.gamma <= 1:
             raise ValueError("gamma must be in (0,1]")
@@ -57,9 +83,15 @@ class CandidateSelector:
         roles = ("elcv", "rfv", "rlv_current", "rlv_target")
         for index, first in enumerate(roles):
             for second in roles[index + 1:]:
-                gap = np.linalg.norm(getattr(candidate, first).states[:, :2] -
-                                     getattr(candidate, second).states[:, :2], axis=1)
-                if np.any(gap < self.overlap_distance):
+                a=getattr(candidate,first).states;b=getattr(candidate,second).states
+                pa=self.position_mapper(first,a) if self.position_mapper else a[:,:2]
+                pb=self.position_mapper(second,b) if self.position_mapper else b[:,:2]
+                gap = np.linalg.norm(pa-pb, axis=1)
+                if self.world_state_mapper is not None and self.shape_provider is not None:
+                    overlaps=vehicle_footprints_overlap(self.world_state_mapper(first,a),self.world_state_mapper(second,b),
+                                                       self.shape_provider(first),self.shape_provider(second))
+                else:overlaps=gap<self.overlap_distance
+                if np.any(overlaps):
                     reasons.append(f"{first}_{second}_overlap")
         if self.lane_check is not None:
             for role in ("elcv", "rfv"):
@@ -123,6 +155,6 @@ class CandidateSelector:
                                 "reward_rfv": candidate.reward_rfv,
                                 "joint_return": candidate.joint_return})
         if not feasible:
-            raise RuntimeError("all joint candidates failed hard feasibility checks")
+            raise CandidateFeasibilityError(diagnostics)
         selected = max(feasible, key=lambda item: item.joint_return)
         return selected, diagnostics

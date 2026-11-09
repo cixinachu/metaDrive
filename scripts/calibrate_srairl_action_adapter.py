@@ -80,11 +80,12 @@ def validate_surface(env,axis,speeds,controls,response,desired_accels):
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument('--output',type=Path,default=Path('outputs/calibration/srairl_action_adapter_v2'))
+    p.add_argument('--output',type=Path,default=Path('outputs/calibration/srairl_action_adapter_v3'))
     p.add_argument('--seed',type=int,default=2718)
     p.add_argument('--mae-limit',type=float,default=.15)
     p.add_argument('--max-error-limit',type=float,default=.30)
-    args=p.parse_args();out=args.output;out.mkdir(parents=True,exist_ok=True)
+    p.add_argument('--closed-loop-report',type=Path)
+    args=p.parse_args();out=args.output;out.mkdir(parents=True,exist_ok=False)
     env=SRAIRLProceduralEnv('straight',lane_num=2,traffic_density=0.,seed=args.seed,
                             horizon=WINDOW+2,traffic_seed=args.seed+1000003)
     surfaces={}
@@ -129,6 +130,10 @@ def main():
         'validated_acceleration_domain':{'ax_mps2':[-1.5,1.5], 'ay_mps2':[-1.5,1.5]},
         'metrics':metrics,'equivalence_status':'passed' if passed else 'failed',
         'physics_evaluation_allowed':bool(passed),'calibration_file':'calibration.npz'}
+    from env.adapters.srairl_calibration import action_calibration_passed
+    if args.closed_loop_report:
+        summary['closed_loop_report']=json.loads(args.closed_loop_report.read_text())
+    summary['physics_evaluation_allowed']=action_calibration_passed(summary,require_closed_loop=True)
     (out/'summary.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
     print(json.dumps(summary,indent=2))
 

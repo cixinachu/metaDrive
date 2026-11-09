@@ -1,0 +1,3 @@
+Source: https://github.com/cixinachu/SR-AIRL/blob/be71aade7acff6455fffc8f1143953ac72bdbca6/Step1_Reward_Recovery/airl.py
+Fetched 2026-11-09. Unmodified upstream test oracle; not a runtime implementation.
+Numerical comparisons inject the same explicit study reward constants into both modules.

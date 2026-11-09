@@ -75,7 +75,7 @@ def _srairl_interaction_template(raw,lane_num):
     defaults=asdict(SRAIRLInteractionScenario());values={}
     try:
         for key,default in defaults.items():
-            value=raw.get('srairl_interaction_'+key,default)
+            value=default if key.endswith('_speed') else raw.get('srairl_interaction_'+key,default)
             values[key]=int(value) if isinstance(default,int) and not isinstance(default,bool) else float(value) if isinstance(default,float) else value
         return SRAIRLInteractionScenario(**values).validate(lane_num)
     except (TypeError,ValueError,OverflowError) as exc:
@@ -84,15 +84,24 @@ def _srairl_interaction_template(raw,lane_num):
 
 def _srairl_interaction_for_scenario(raw,lane_num,scenario_type):
     from dataclasses import asdict
-    from env.tasks.srairl_interaction import with_scenario_speeds
+    from env.tasks.srairl_interaction import with_scenario_speeds, SCENARIO_SPEED_CONFIG
     scenario=with_scenario_speeds(_srairl_interaction_template(raw,lane_num),scenario_type)
     values=asdict(scenario)
-    # Keep explicit user speed overrides; otherwise use the scenario's
-    # geometry-matched ELCV/RFV targets.
-    for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
-        user_key='srairl_interaction_'+key
-        if user_key in raw:
-            values[key]=float(raw[user_key])
+    # Overrides are opt-in and keyed by scenario; a selected scene must never
+    # leak its speed into the other members of a collection batch.
+    overrides = raw.get('srairl_speed_overrides', {})
+    if not isinstance(overrides, dict):
+        raise ValueError('srairl_speed_overrides must be a scenario mapping')
+    if set(overrides) - {'straight', 'curve', 'merge'}:
+        raise ValueError('unsupported speed override scenario')
+    if not isinstance(raw.get('srairl_custom_speeds',False),bool):
+        raise ValueError('srairl_custom_speeds must be boolean')
+    if raw.get('srairl_custom_speeds', False):
+        selected = overrides.get(scenario_type, {})
+        if not isinstance(selected, dict) or set(selected) - set(SCENARIO_SPEED_CONFIG[scenario_type]):
+            raise ValueError('invalid scenario speed overrides')
+        for key, value in selected.items():
+            values[key] = float(value)
     from env.tasks.srairl_interaction import SRAIRLInteractionScenario
     return asdict(SRAIRLInteractionScenario(**values).validate(lane_num))
 
@@ -128,7 +137,7 @@ def clean_srairl_request(raw, kind):
             'lane_num':lane_num,'traffic_density':float(density),'horizon':horizon,'demo_episodes':episodes,
             'seed':seed,'scene_seed':seed,'traffic_seed':(seed+1_000_003)%(2**32),'rl_seed':seed,
             'device':'cpu','srairl_view':view_mode,'dynamics_mode':'metadrive_physics',
-            'interaction_scenario':base_interaction,'expert_controller':'gap_acceptance_headway_v2'}
+            'interaction_scenario':base_interaction,'expert_controller':'curvature-feedback-v3'}
     scene_source=raw.get('srairl_scene_source','procedural')
     if scene_source!='procedural':
         raise ValueError('当前 SR-AIRL 实验只使用 MetaDrive 生成的道路和车辆')
@@ -147,7 +156,7 @@ def clean_srairl_request(raw, kind):
             transitions,metadata=load_transitions(path)
             expert_transitions.extend(transitions);expert_metadata.append(metadata)
         from datasets.srairl.native_windows import native_dataset_info
-        native_dataset_info(expert_paths)
+        native_dataset_info(expert_paths,require_current=True)
         training_scenarios=sorted({str(name) for row in expert_metadata
             for name in (row.get('scenarios') or [row.get('scenario')]) if name in ('straight','curve','merge')})
         if not training_scenarios:
@@ -338,7 +347,7 @@ def _native_component_dataset(raw):
     if not paths or any(path.parent!=root or path.suffix!='.npz' or not path.is_file() for path in paths):
         raise ValueError('请选择已采集且包含 train/validation/test 的 MetaDrive 专家示范数据集')
     from datasets.srairl.native_windows import native_dataset_info
-    info=native_dataset_info(paths)
+    info=native_dataset_info(paths,require_current=True)
     if any(info['windows_by_split'].get(name,0)<1 for name in ('train','validation','test')):
         raise ValueError('MetaDrive 示范集的 train/validation/test 至少各需要一个完整 20+100 窗口')
     return [str(path.relative_to(ROOT)) for path in paths]
