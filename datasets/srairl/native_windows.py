@@ -75,6 +75,10 @@ def _validate_archive(data):
         raise ValueError("MetaDrive desired, mapped and measured actor actions are not aligned")
     if not all(np.isfinite(array).all() for array in (states,times,actions,mapped_actions,measured_actions,reference)):
         raise ValueError("MetaDrive native archive contains non-finite trajectory data")
+    if "trajectory_tracking_errors" in data.files:
+        tracking=data["trajectory_tracking_errors"]
+        if tracking.shape!=actions.shape or not np.isfinite(tracking).all():
+            raise ValueError("MetaDrive native archive tracking errors do not align with actions")
     return states, times, actions, state_offsets, action_offsets, metadata
 
 

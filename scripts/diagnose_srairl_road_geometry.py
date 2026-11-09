@@ -1,0 +1,153 @@
+"""Measure curvature and steady lateral-acceleration demand on SR-AIRL maps."""
+import argparse
+import json
+from pathlib import Path
+import sys
+from dataclasses import replace
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from env.tasks.srairl_metadrive_world import SRAIRLProceduralWorld
+
+
+def lane_curvature(lane, samples=400):
+    """Return sampled absolute curvature along one generated MetaDrive lane."""
+    length = float(lane.length)
+    s = np.linspace(0.0, length, max(3, int(samples)))
+    heading = np.unwrap(np.asarray([lane.heading_theta_at(float(x)) for x in s]))
+    curvature = np.abs(np.gradient(heading, s, edge_order=2))
+    return s, curvature
+
+
+def path_geometry(path, samples_per_lane=400, details=False):
+    lanes = []
+    all_k = []
+    for lane in path:
+        s, k = lane_curvature(lane, samples_per_lane)
+        all_k.append(k)
+        max_index = int(np.argmax(k))
+        lanes.append({
+            "lane_index": [str(part) for part in lane.index],
+            "length_m": float(lane.length),
+            "max_curvature_per_m": float(k[max_index]),
+            "min_radius_m": float(1.0 / k[max_index]) if k[max_index] > 1e-9 else None,
+            "max_curvature_s_m": float(s[max_index]),
+        })
+    values = np.concatenate(all_k) if all_k else np.asarray([0.0])
+    max_k = float(np.max(values))
+    return {
+        "lane_count": len(path),
+        "length_m": float(sum(float(lane.length) for lane in path)),
+        "max_curvature_per_m": max_k,
+        "min_radius_m": float(1.0 / max_k) if max_k > 1e-9 else None,
+        "highest_curvature_lanes": sorted(lanes, key=lambda row: row["max_curvature_per_m"],
+                                           reverse=True)[:5],
+        **({"lanes": lanes} if details else {}),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--scenarios", nargs="+", choices=("curve", "merge"), default=("curve", "merge"))
+    parser.add_argument("--lane-num", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--samples-per-lane", type=int, default=400)
+    parser.add_argument("--details", action="store_true")
+    parser.add_argument("--closed-loop", action="store_true",
+                        help="also collect a MetaDrive teacher episode at each requested speed")
+    parser.add_argument("--closed-loop-episodes", type=int, default=1)
+    parser.add_argument("--speeds", nargs="+", type=float, default=(6, 10, 15, 20, 25))
+    args = parser.parse_args()
+    reports = []
+    for scenario in args.scenarios:
+        world = SRAIRLProceduralWorld(
+            scenario_type=scenario, lane_num=args.lane_num, traffic_density=0.0,
+            seed=args.seed, horizon=500,
+        )
+        try:
+            world.reset(seed=args.seed)
+            ego = world.role_vehicle("elcv")
+            ramp_or_curve_path = world._lane_path(ego.lane)
+            if scenario == "curve":
+                first_road=world.current_map.road_network.graph[">>"][">>>"]
+                paths={f"curve_route_lane_{index}":world._lane_path(lane)
+                       for index,lane in enumerate(first_road)}
+            else:
+                paths={"merge_ramp_to_mainline_route":ramp_or_curve_path}
+                graph = world.current_map.road_network.graph
+                paths["merge_mainline_lane_2"] = world._lane_path(graph[">>>"]["1r0_0_"][2])
+            for name, path in paths.items():
+                geometry = path_geometry(path, args.samples_per_lane, details=args.details)
+                geometry["scenario"] = scenario
+                geometry["path"] = name
+                geometry["steady_lateral_acceleration_mps2"] = {
+                    str(speed): float(speed * speed * geometry["max_curvature_per_m"])
+                    for speed in args.speeds
+                }
+                reports.append(geometry)
+        finally:
+            world.close()
+    closed_loop = []
+    if args.closed_loop:
+        from env.tasks.srairl_interaction import SRAIRLInteractionScenario
+        from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+        from datasets.srairl.metadrive_expert import collect_metadrive_expert
+        for scenario in args.scenarios:
+            for speed in args.speeds:
+                base=SRAIRLInteractionScenario()
+                if scenario=="curve":
+                    interaction=replace(base,elcv_speed=speed,rfv_speed=speed,
+                        rlv_current_speed=speed,rlv_target_speed=speed)
+                else:
+                    interaction=replace(base,elcv_speed=speed,rlv_current_speed=speed)
+                env=SRAIRLProceduralEnv(scenario,args.lane_num,0.,args.seed,700,
+                    interaction_scenario=interaction)
+                try:
+                    _,rows,episodes=collect_metadrive_expert(env,args.closed_loop_episodes,args.seed)
+                    for row,episode in zip(rows,episodes):
+                        desired=np.asarray(episode["desired_acceleration"],dtype=float)
+                        actual=np.asarray(episode["actual_acceleration"],dtype=float)
+                        mapped=np.asarray(episode["metadrive_actions"],dtype=float)
+                        tracking=np.asarray(episode["tracking_errors"],dtype=float)
+                        lateral_actual=np.abs(actual[:,:,1]) if actual.size else np.empty((0,))
+                        smoothed_peak=None
+                        if lateral_actual.ndim==2 and len(lateral_actual)>=5:
+                            smoothed=np.stack([np.convolve(lateral_actual[:,role],np.ones(5)/5.,mode="valid")
+                                               for role in range(lateral_actual.shape[1])],axis=1)
+                            smoothed_peak=float(np.max(smoothed))
+                        closed_loop.append({
+                            "scenario":scenario,"requested_ego_speed_mps":float(speed),
+                            "episode":row["episode"],"seed":row["seed"],"accepted":row["accepted"],
+                            "lane_change_success":row["merge_success"],"collision":row["collision"],
+                            "out_of_road":row["out_of_road"],"steps":row["steps"],
+                            "lateral_command_saturation_fraction":float(np.mean(np.abs(desired[:,:,1])>=1.499)) if desired.size else None,
+                            "steering_saturation_fraction":float(np.mean(np.abs(mapped[:,:,0])>=0.99)) if mapped.size else None,
+                            "max_abs_normalized_steering":float(np.max(np.abs(mapped[:,:,0]))) if mapped.size else None,
+                            "max_abs_measured_lateral_acceleration_mps2":float(np.max(np.abs(actual[:,:,1]))) if actual.size else None,
+                            "max_5_step_mean_abs_lateral_acceleration_mps2":smoothed_peak,
+                            "mean_abs_lateral_acceleration_error_mps2":float(np.mean(
+                                np.abs(actual[:,:,1]-desired[:,:,1]))) if desired.size else None,
+                            "mean_abs_lane_lateral_error_m":float(np.mean(np.abs(tracking[:,:,0]))) if tracking.size else None,
+                            "max_abs_lane_lateral_error_m":float(np.max(np.abs(tracking[:,:,0]))) if tracking.size else None,
+                            "mean_abs_heading_error_deg":float(np.degrees(np.mean(np.abs(tracking[:,:,1])))) if tracking.size else None,
+                            "max_abs_heading_error_deg":float(np.degrees(np.max(np.abs(tracking[:,:,1])))) if tracking.size else None,
+                            "validation_errors":episode["validation"]["errors"],
+                        })
+                finally:
+                    env.close()
+    print(json.dumps({
+        "simulator": "MetaDrive",
+        "seed": args.seed,
+        "lane_num": args.lane_num,
+        "samples_per_lane": args.samples_per_lane,
+        "speeds_mps": args.speeds,
+        "paths": reports,
+        "closed_loop_teacher_episodes": closed_loop,
+    }, indent=2))
+
+
+if __name__ == "__main__":
+    main()

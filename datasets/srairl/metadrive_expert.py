@@ -10,8 +10,12 @@ class MetaDriveExpertController:
     ELCV tracks the target gap between RFV and RLV_target while RFV follows its
     current lane leader. This is a scripted task teacher, not a human expert.
     """
-    def __init__(self, env, desired_speed=22., time_headway=1.4, standstill_gap=7.):
-        self.env=env;self.desired_speed=float(desired_speed)
+    def __init__(self, env, desired_speed=None, time_headway=1.4, standstill_gap=7.):
+        self.env=env
+        self.desired_speed=(dict(desired_speed) if isinstance(desired_speed,dict) else
+            {"elcv":float(desired_speed),"rfv":float(desired_speed)} if desired_speed is not None else
+            {"elcv":float(env.interaction_scenario.elcv_speed),
+             "rfv":float(env.interaction_scenario.rfv_speed)})
         self.time_headway=float(time_headway);self.standstill_gap=float(standstill_gap)
         spec=env.interaction_scenario
         self.target_lanes={'elcv':int(spec.target_lane),'rfv':int(spec.target_lane)}
@@ -21,7 +25,10 @@ class MetaDriveExpertController:
             index=0 if str(vehicle.lane_index[0]).startswith('1r1_') else 2
             a,b=vehicle.lane_index[:2];lanes=self.env.world.current_map.road_network.graph[a][b]
             return lanes[min(index,len(lanes)-1)]
-        path=self.env._target_lane_path
+        path=(self.env._source_lane_path
+              if int(self.target_lanes.get(role,self.env.interaction_scenario.target_lane))==
+              int(self.env.interaction_scenario.source_lane)
+              else self.env._target_lane_path)
         position=np.asarray(vehicle.position,dtype=float)[:2]
         candidates=[]
         for lane in path:
@@ -29,13 +36,22 @@ class MetaDriveExpertController:
             candidates.append((float(np.linalg.norm(position-np.asarray(lane.position(s,0.)))),lane))
         return min(candidates,key=lambda item:item[0])[1]
 
+    def tracking_error(self,vehicle,role):
+        """Return signed lateral and heading errors relative to the teacher path."""
+        target_lane=self._target_lane(vehicle,role)
+        target_s,lateral=target_lane.local_coordinates(vehicle.position)
+        lane_heading=float(target_lane.heading_theta_at(float(target_s)))
+        heading_error=(float(vehicle.heading_theta)-lane_heading+np.pi)%(2.*np.pi)-np.pi
+        return float(lateral),float(heading_error)
+
     def action(self,role):
         vehicle=self.env.world.role_vehicle(role);lane=vehicle.lane
+        desired_speed=self.desired_speed[role]
         x,y=map(float,vehicle.position[:2]);vx,vy=map(float,vehicle.velocity[:2])
         s,lateral=lane.local_coordinates((x,y));heading=float(lane.heading_theta_at(s))
         tangent=np.asarray([np.cos(heading),np.sin(heading)]);normal=np.asarray([-tangent[1],tangent[0]])
         vlong=float(np.asarray([vx,vy])@tangent);vlat=float(np.asarray([vx,vy])@normal)
-        leader_gap=float('inf');leader_speed=self.desired_speed
+        leader_gap=float('inf');leader_speed=desired_speed
         for other in self.env._vehicle_pool():
             if other is vehicle:continue
             try:other_index=tuple(other.lane_index)
@@ -52,16 +68,20 @@ class MetaDriveExpertController:
         desired_gap=self.standstill_gap+self.time_headway*max(vlong,0.)
         if np.isfinite(leader_gap):
             following_accel=.55*(leader_speed-vlong)+.12*(leader_gap-desired_gap)
-            speed_limit_accel=.6*(self.desired_speed-vlong)
+            speed_limit_accel=.6*(desired_speed-vlong)
             a_long=float(np.clip(min(following_accel,speed_limit_accel),-1.5,1.5))
-        else:a_long=float(np.clip(.6*(self.desired_speed-vlong),-1.5,1.5))
+        else:a_long=float(np.clip(.6*(desired_speed-vlong),-1.5,1.5))
         target_lane=self._target_lane(vehicle,role)
         target_s,lateral=target_lane.local_coordinates(vehicle.position)
         lane_heading=float(target_lane.heading_theta_at(float(target_s)))
         lane_normal=np.asarray([-np.sin(lane_heading),np.cos(lane_heading)])
         target_lateral_speed=float(np.asarray(vehicle.velocity[:2])@lane_normal)
+        # Follow generated path curvature and stabilize lane position/heading.
+        # local_coordinates() is positive toward the lane's right side, while
+        # this controller's lateral acceleration uses the left normal.
+        heading_error=(float(vehicle.heading_theta)-lane_heading+np.pi)%(2.*np.pi)-np.pi
+        curvature_accel=0.
         if self.env.scenario_type in ('curve','merge'):
-            # Follow generated path curvature, then correct lane displacement.
             ds=min(1.,max(.25,float(target_s)),max(.25,float(target_lane.length-target_s)))
             s0=max(0.,float(target_s)-ds);s1=min(float(target_lane.length),float(target_s)+ds)
             h0=float(target_lane.heading_theta_at(s0));h1=float(target_lane.heading_theta_at(s1))
@@ -70,11 +90,10 @@ class MetaDriveExpertController:
             tangent=np.asarray([np.cos(lane_heading),np.sin(lane_heading)])
             speed_along=float(np.asarray(vehicle.velocity[:2])@tangent)
             curvature_accel=speed_along*speed_along*curvature
-            a_lat=float(np.clip(curvature_accel+.15*float(lateral)-.4*target_lateral_speed,-1.5,1.5))
-        else:
-            # Straight and ramp-merge maneuvers use the target-lane frame;
-            # merge path curvature changes discontinuously at the join.
-            a_lat=float(np.clip(.8*float(lateral)-.35*target_lateral_speed,-1.5,1.5))
+        # +e_y, -e_heading and -v_y all produce acceleration back toward the
+        # target lane. The same feedback law applies on straight and curved maps.
+        a_lat=float(np.clip(curvature_accel+.6*float(lateral)-
+                            .8*heading_error-1.2*target_lateral_speed,-1.5,1.5))
         return np.asarray([a_long,a_lat],dtype=np.float32)
 
 
@@ -126,6 +145,7 @@ def validate_expert_episode(raw, minimum_future_steps=100, minimum_history_steps
     desired=np.asarray(raw.get('desired_acceleration',[]),dtype=np.float64)
     mapped=np.asarray(raw.get('metadrive_actions',[]),dtype=np.float64)
     measured=np.asarray(raw.get('actual_acceleration',[]),dtype=np.float64)
+    tracking=np.asarray(raw.get('tracking_errors',[]),dtype=np.float64)
     n=len(times)
     if states.shape!=(n,4,4):errors.append('four_role_state_shape')
     if reference.shape!=(n,4,4) or len(lane_indices)!=n:errors.append('four_role_reference_alignment')
@@ -157,6 +177,8 @@ def validate_expert_episode(raw, minimum_future_steps=100, minimum_history_steps
     if completed is None or n-1-int(completed)<minimum_future_steps:errors.append('incomplete_future_after_lane_change')
     if measured.size and (np.max(np.abs(measured[:,:,0]))>8. or np.max(np.abs(measured[:,:,1]))>8.):
         errors.append('implausible_measured_acceleration')
+    if 'tracking_errors' in raw and (tracking.shape!=(action_steps,2,2) or not np.isfinite(tracking).all()):
+        errors.append('tracking_error_alignment')
     # Require RFV's measured response to vary with the interaction rather than
     # accepting an unchanged/frozen background actor as a demonstration.
     if measured.shape==(action_steps,2,2) and len(measured)>10:
@@ -181,8 +203,7 @@ def collect_metadrive_expert(env, episodes, seed, callback=None):
         if callback and not callback(dict(state='running',step=episode,total=int(episodes),episodes=episode)):
             break
         observations,_=env.reset(seed=int(seed)+episode)
-        controller_speed={'curve':6.,'merge':6.}.get(env.scenario_type,22.)
-        controller=MetaDriveExpertController(env,desired_speed=controller_speed)
+        controller=MetaDriveExpertController(env)
         done=False;step=0;collisions=0;offroad=0;distance=0.;started=False;completed=False
         initial_gap=float(env._initial_gap);final_gap=initial_gap;time_to_lane_change=None
         initial_rfv_speed=float(env._rfv_initial_speed);final_rfv_speed=initial_rfv_speed;rfv_min_accel=0.
@@ -197,10 +218,12 @@ def collect_metadrive_expert(env, episodes, seed, callback=None):
         # Warm-up initializes temporal history; exclude it from interaction
         # response acceleration statistics.
         env._rfv_min_accel=0.
-        episode_transitions=[];desired_actions=[];mapped_actions=[];measured_actions=[]
+        episode_transitions=[];desired_actions=[];mapped_actions=[];measured_actions=[];tracking_errors=[]
         completion_index=None;post_completion=0;events=[]
         while not done and (completion_index is None or post_completion<future_steps):
             state=observations['elcv'].copy()
+            tracking_errors.append(np.asarray([controller.tracking_error(env.world.role_vehicle(role),role)
+                                               for role in ('elcv','rfv')],dtype=np.float32))
             actions={role:controller.action(role) for role in ('elcv','rfv')}
             vehicles={role:env.world.role_vehicle(role) for role in ('elcv','rfv')}
             before={role:(np.asarray(vehicles[role].velocity,dtype=np.float64)[:2].copy(),
@@ -238,6 +261,7 @@ def collect_metadrive_expert(env, episodes, seed, callback=None):
             reference_states_frenet=np.asarray(reference_states),lane_indices=lane_indices,
             times_s=np.asarray(times),desired_acceleration=np.asarray(desired_actions,dtype=np.float32),
             metadrive_actions=np.asarray(mapped_actions,dtype=np.float32),actual_acceleration=np.asarray(measured_actions,dtype=np.float32),
+            tracking_errors=np.asarray(tracking_errors,dtype=np.float32),
             lane_change_completion_index=completion_index,lane_change_success=task_success,
             collision=bool(collisions),out_of_road=bool(offroad),seed=int(seed)+episode,scenario=env.scenario_type,
             warmup_steps=history_steps,minimum_future_steps=future_steps)
@@ -280,7 +304,8 @@ def save_raw_episode(path, raw):
         desired_acceleration=np.asarray(raw['desired_acceleration'],dtype=np.float32),
         metadrive_actions=np.asarray(raw['metadrive_actions'],dtype=np.float32),
         actual_acceleration=np.asarray(raw['actual_acceleration'],dtype=np.float32),
+        tracking_errors=np.asarray(raw['tracking_errors'],dtype=np.float32),
         metadata=np.asarray(__import__('json').dumps({k:v for k,v in raw.items() if k not in {
             'role_order','role_states','reference_states_frenet','lane_indices','times_s',
-            'desired_acceleration','metadrive_actions','actual_acceleration'}},
+            'desired_acceleration','metadrive_actions','actual_acceleration','tracking_errors'}},
             ensure_ascii=False,allow_nan=False)))

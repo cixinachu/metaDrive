@@ -152,8 +152,11 @@ def save_transitions(path, transitions, metadata, raw_episodes=None):
             trajectory_action_offsets=np.asarray(action_offsets,dtype=np.int64),
             trajectory_metadata=np.asarray(json.dumps([{k:v for k,v in x.items() if k not in {
                 'role_order','role_states','reference_states_frenet','lane_indices','times_s',
-                'desired_acceleration','metadrive_actions','actual_acceleration'}}
+                'desired_acceleration','metadrive_actions','actual_acceleration','tracking_errors'}}
                 for x in accepted],ensure_ascii=False,allow_nan=False)))
+        if all('tracking_errors' in x for x in accepted):
+            arrays['trajectory_tracking_errors']=np.concatenate([
+                np.asarray(x['tracking_errors'],dtype=np.float32) for x in accepted])
     np.savez_compressed(path,**arrays)
     return len(ordered)
 

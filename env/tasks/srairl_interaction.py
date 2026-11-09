@@ -3,6 +3,24 @@ from dataclasses import dataclass
 import math
 
 
+SCENARIO_SPEED_CONFIG = {
+    "straight": {"elcv_speed": 22.0, "rfv_speed": 22.0,
+                 "rlv_current_speed": 22.0, "rlv_target_speed": 22.0},
+    "curve": {"elcv_speed": 15.0, "rfv_speed": 15.0,
+              "rlv_current_speed": 15.0, "rlv_target_speed": 15.0},
+    "merge": {"elcv_speed": 20.0, "rfv_speed": 22.0,
+              "rlv_current_speed": 20.0, "rlv_target_speed": 22.0},
+}
+
+
+def with_scenario_speeds(scenario, scenario_type):
+    """Apply the measured-design target speeds to a procedural interaction."""
+    from dataclasses import replace
+    if scenario_type not in SCENARIO_SPEED_CONFIG:
+        raise ValueError(f"unsupported SR-AIRL scenario: {scenario_type}")
+    return replace(scenario, **SCENARIO_SPEED_CONFIG[scenario_type])
+
+
 @dataclass(frozen=True)
 class SRAIRLInteractionScenario:
     source_lane: int = 0

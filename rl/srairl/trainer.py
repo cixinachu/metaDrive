@@ -15,6 +15,7 @@ from torch import nn
 from rl.srairl.config import SRAIRLConfig
 from rl.srairl.discriminator import AnisotropicInteractionPotential, SocialAIRLDiscrim
 from rl.srairl.ppo import PPO
+from rl.srairl import reward_config as defaults
 from env.tasks.srairl_env import SRAIRLEnv
 
 
@@ -40,7 +41,7 @@ def counterfactual_preference_mask(states, config, *, gap_reduction_m=5.0):
 
 @dataclass(frozen=True)
 class SRAIRLTrainingConfig:
-    episodes: int = 110001
+    episodes: int = defaults.MAX_EPISODES
     action_scale: float = 1.5
     actor_lr: float = 3e-4
     critic_lr: float = 1e-3
@@ -56,9 +57,9 @@ class SRAIRLTrainingConfig:
     discriminator_updates: int = 10
     lambda_social: float = 0.0
     lambda_equilibrium: float = 0.01
-    lambda_rank: float = 0.1
+    lambda_rank: float = defaults.RANK_LAMBDA
     preference_margin: float = 0.01
-    seed: int = 0
+    seed: int = defaults.SEED
     device: str = "auto"
 
     def __post_init__(self):
@@ -134,15 +135,23 @@ class SRAIRLTrainer:
         self.shared_potential = AnisotropicInteractionPotential(self.config.potential_longitudinal_scale,
             self.config.potential_lateral_scale, self.config.direction_lambda,
             pos_lat_scale=self.config.pos_lat_scale,pos_long_scale=self.config.pos_long_scale,
-            vel_scale=self.config.vel_scale,vel_offset=self.config.vel_offset).to(self.device)
+            vel_scale=self.config.vel_scale,vel_offset=self.config.vel_offset,
+            prediction_horizon=self.config.interaction_prediction_horizon_s,
+            prediction_steps=self.config.interaction_prediction_steps,
+            prediction_dt=self.config.dt_s).to(self.device)
         self.discriminator_elcv = SocialAIRLDiscrim(state_dim, self.config.gamma, self.shared_potential,
-            self.config.alpha_init, role="lcv", history_len=self.config.history_len).to(self.device)
+            self.config.alpha_init, role="lcv", history_len=self.config.history_len,
+            dt=self.config.dt_s,acceleration_scale=self.config.acceleration_scale,
+            jerk_scale=self.config.jerk_scale).to(self.device)
         self.discriminator_rfv = SocialAIRLDiscrim(state_dim, self.config.gamma, self.shared_potential,
-            self.config.alpha_init, role="fv", history_len=self.config.history_len).to(self.device)
+            self.config.alpha_init, role="fv", history_len=self.config.history_len,
+            dt=self.config.dt_s,acceleration_scale=self.config.acceleration_scale,
+            jerk_scale=self.config.jerk_scale).to(self.device)
         parameters = list(self.discriminator_elcv.private_g.parameters()) + list(self.discriminator_elcv.h.parameters()) + [self.discriminator_elcv.alpha_raw]
         parameters += list(self.discriminator_rfv.private_g.parameters()) + list(self.discriminator_rfv.h.parameters()) + [self.discriminator_rfv.alpha_raw]
+        parameters += list(self.shared_potential.parameters())
         self.discriminator_optimizer = torch.optim.Adam(parameters, lr=self.train_config.discriminator_lr)
-        self.bce = nn.BCELoss()
+        self.bce = nn.BCEWithLogitsLoss()
         self.output_dir = Path(output_dir) if output_dir else None
         self.global_steps = 0
         self.episode = 0
@@ -195,14 +204,18 @@ class SRAIRLTrainer:
             with torch.no_grad():
                 log_exp_e, _, _ = self.policy_elcv.policy.evaluate(exp["states"], exp["actions_elcv"] / d.action_scale)
                 log_exp_f, _, _ = self.policy_rfv.policy.evaluate(exp["states"], exp["actions_rfv"] / d.action_scale)
-            p_gen_e = self.discriminator_elcv(gen_e["states"], gen_e["dones"], gen_e["logprobs"], gen_e["next_states"])
-            p_exp_e = self.discriminator_elcv(exp["states"], exp["dones"], log_exp_e, exp["next_states"])
-            p_gen_f = self.discriminator_rfv(gen_f["states"], gen_f["dones"], gen_f["logprobs"], gen_f["next_states"])
-            p_exp_f = self.discriminator_rfv(exp["states"], exp["dones"], log_exp_f, exp["next_states"])
-            p_gen_e, p_exp_e = p_gen_e.clamp(.05,.95), p_exp_e.clamp(.05,.95)
-            p_gen_f, p_exp_f = p_gen_f.clamp(.05,.95), p_exp_f.clamp(.05,.95)
-            loss = self.bce(p_exp_e, torch.full_like(p_exp_e,.9)) + self.bce(p_exp_f, torch.full_like(p_exp_f,.9))
-            loss += self.bce(p_gen_e, torch.full_like(p_gen_e,.1)) + self.bce(p_gen_f, torch.full_like(p_gen_f,.1))
+            logits_gen_e = self.discriminator_elcv.discriminator_logits(
+                gen_e["states"], gen_e["dones"], gen_e["logprobs"], gen_e["next_states"])
+            logits_exp_e = self.discriminator_elcv.discriminator_logits(
+                exp["states"], exp["dones"], log_exp_e, exp["next_states"])
+            logits_gen_f = self.discriminator_rfv.discriminator_logits(
+                gen_f["states"], gen_f["dones"], gen_f["logprobs"], gen_f["next_states"])
+            logits_exp_f = self.discriminator_rfv.discriminator_logits(
+                exp["states"], exp["dones"], log_exp_f, exp["next_states"])
+            loss = self.bce(logits_exp_e, torch.full_like(logits_exp_e,.9))
+            loss += self.bce(logits_exp_f, torch.full_like(logits_exp_f,.9))
+            loss += self.bce(logits_gen_e, torch.full_like(logits_gen_e,.1))
+            loss += self.bce(logits_gen_f, torch.full_like(logits_gen_f,.1))
             social = loss.new_zeros(()); equilibrium = loss.new_zeros(()); rank = loss.new_zeros(())
             if d.lambda_social > 0:
                 _, private_e, _ = self.discriminator_elcv.get_reward(exp["states"])
@@ -229,8 +242,8 @@ class SRAIRLTrainer:
             total = loss + d.lambda_social*social + d.lambda_equilibrium*equilibrium + d.lambda_rank*rank
             self.discriminator_optimizer.zero_grad(); total.backward(); self.discriminator_optimizer.step()
             losses.append(float(total.detach().cpu()))
-            accuracies.append((float((p_exp_e>.5).float().mean()), float((p_gen_e<.5).float().mean()),
-                               float((p_exp_f>.5).float().mean()), float((p_gen_f<.5).float().mean())))
+            accuracies.append((float((logits_exp_e>0).float().mean()), float((logits_gen_e<0).float().mean()),
+                               float((logits_exp_f>0).float().mean()), float((logits_gen_f<0).float().mean())))
             with torch.no_grad():
                 _, _, phi = self.discriminator_elcv.get_reward(exp["states"])
                 private_values.append(float(self.discriminator_elcv.get_reward(exp["states"])[1].mean().cpu()))
@@ -241,7 +254,8 @@ class SRAIRLTrainer:
         # Recover AIRL reward for every accumulated policy transition, as in upstream.
         for policy, disc in ((self.policy_elcv, self.discriminator_elcv), (self.policy_rfv, self.discriminator_rfv)):
             data = policy.buffer.tensors()
-            recovered = disc.calculate_reward(data["states"], data["dones"], data["logprobs"], data["next_states"]).squeeze(-1)
+            recovered = disc.calculate_policy_reward(
+                data["states"], data["dones"], data["logprobs"], data["next_states"]).squeeze(-1)
             policy.buffer.rewards = torch.clamp(recovered, -10., 10.).detach().cpu().tolist()
         return {"discriminator_loss": float(np.mean(losses)),
                 "expert_accuracy_elcv": float(np.mean([a[0] for a in accuracies])),
@@ -252,7 +266,10 @@ class SRAIRLTrainer:
                 "preference_rank_loss": float(np.mean(rank_losses)) if rank_losses else 0.0,
                 "preference_pairs_used": float(np.mean(rank_pair_counts)) if rank_pair_counts else 0.0,
                 "alpha_elcv": float(self.discriminator_elcv.alpha.detach().cpu()),
-                "alpha_rfv": float(self.discriminator_rfv.alpha.detach().cpu())}
+                "alpha_rfv": float(self.discriminator_rfv.alpha.detach().cpu()),
+                "potential_L_long_m": float(self.shared_potential.L_long.detach().cpu()),
+                "potential_L_lat_m": float(self.shared_potential.L_lat.detach().cpu()),
+                "potential_dir_lambda": float(self.shared_potential.dir_lambda.detach().cpu())}
 
     def save(self, directory=None):
         directory = Path(directory) if directory else self.output_dir

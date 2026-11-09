@@ -37,6 +37,9 @@ def load_reward_discriminator(model_dir, device="cpu", role="fv"):
         pos_long_scale=cfg.pos_long_scale,
         vel_scale=cfg.vel_scale,
         vel_offset=cfg.vel_offset,
+        prediction_horizon=cfg.interaction_prediction_horizon_s,
+        prediction_steps=cfg.interaction_prediction_steps,
+        prediction_dt=cfg.dt_s,
     )
     discriminator = SocialAIRLDiscrim(
         state_dim,
@@ -45,6 +48,9 @@ def load_reward_discriminator(model_dir, device="cpu", role="fv"):
         cfg.alpha_init,
         role=role,
         history_len=cfg.history_len,
+        dt=cfg.dt_s,
+        acceleration_scale=cfg.acceleration_scale,
+        jerk_scale=cfg.jerk_scale,
     )
     state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     discriminator.load_state_dict(state, strict=True)

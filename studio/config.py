@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import math
 from env.research_config import load_config, validate_config
+from rl.srairl import reward_config as srairl_defaults
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT/'outputs/studio'  # Preview cache and legacy runs
@@ -81,6 +82,21 @@ def _srairl_interaction_template(raw,lane_num):
         raise ValueError(f'Invalid SR-AIRL interaction template: {exc}') from exc
 
 
+def _srairl_interaction_for_scenario(raw,lane_num,scenario_type):
+    from dataclasses import asdict
+    from env.tasks.srairl_interaction import with_scenario_speeds
+    scenario=with_scenario_speeds(_srairl_interaction_template(raw,lane_num),scenario_type)
+    values=asdict(scenario)
+    # Keep explicit user speed overrides; otherwise use the scenario's
+    # geometry-matched ELCV/RFV targets.
+    for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
+        user_key='srairl_interaction_'+key
+        if user_key in raw:
+            values[key]=float(raw[user_key])
+    from env.tasks.srairl_interaction import SRAIRLInteractionScenario
+    return asdict(SRAIRLInteractionScenario(**values).validate(lane_num))
+
+
 def clean_srairl_request(raw, kind):
     """Validate the isolated SR-AIRL Studio interface."""
     if kind not in ('train','eval'):
@@ -92,7 +108,7 @@ def clean_srairl_request(raw, kind):
         if kind!='train':raise ValueError('专家示范采集属于数据生成操作，请选择训练模式')
         scenario_type=raw.get('srairl_scenario','straight');lane_num=raw.get('srairl_lane_num',3)
         density=raw.get('srairl_traffic_density',.15);horizon=raw.get('srairl_horizon',1000)
-        episodes=raw.get('srairl_demo_episodes',10);seed=raw.get('srairl_seed',0)
+        episodes=raw.get('srairl_demo_episodes',10);seed=raw.get('srairl_seed',srairl_defaults.SEED)
         scenario_types=raw.get('srairl_collect_scenarios') or [scenario_type]
         if not isinstance(scenario_types,(list,tuple)) or not scenario_types or any(name not in ('straight','curve','merge') for name in scenario_types):raise ValueError('MetaDrive 专家示范支持直道、弯道和匝道汇入，可单独或批量选择')
         scenario_types=list(dict.fromkeys(scenario_types))
@@ -104,17 +120,9 @@ def clean_srairl_request(raw, kind):
         if isinstance(seed,bool) or not isinstance(seed,int) or not 0<=seed<2**32:raise ValueError('随机种子超出范围')
         view_mode=raw.get('srairl_view','topdown')
         if view_mode not in ('topdown','chase3d','first3d','bird3d'):raise ValueError('MetaDrive 画面视角无效')
-        from dataclasses import asdict
-        base_interaction=asdict(_srairl_interaction_template(raw,lane_num))
-        interaction_scenarios={}
-        for current_scenario in scenario_types:
-            interaction=dict(base_interaction)
-            if current_scenario in ('curve','merge'):
-            # Start at a map-specific feasible speed because native curve and
-            # ramp curvature exceed the calibrated action envelope at highway speed.
-                for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
-                    interaction[key]=min(float(interaction[key]),6.)
-            interaction_scenarios[current_scenario]=interaction
+        interaction_scenarios={current_scenario:_srairl_interaction_for_scenario(
+            raw,lane_num,current_scenario) for current_scenario in scenario_types}
+        base_interaction=interaction_scenarios[scenario_types[0]]
         return {'task':'srairl','operation':operation,'scene_source':'procedural','scenario':scenario_type,
             'scenarios':scenario_types,'interaction_scenarios':interaction_scenarios,
             'lane_num':lane_num,'traffic_density':float(density),'horizon':horizon,'demo_episodes':episodes,
@@ -147,9 +155,22 @@ def clean_srairl_request(raw, kind):
         config_dim=16*SRAIRLConfig.from_mapping().history_len
         if any(item.state.shape!=(config_dim,) or item.action.shape!=(2,) for item in expert_transitions):
             raise ValueError('MetaDrive 专家示范的状态/动作维度与当前 SR-AIRL 模型不匹配')
+        scenario_traffic_densities={}
+        for metadata in expert_metadata:
+            by_scenario=metadata.get('traffic_density_by_scenario',{})
+            for name in training_scenarios:
+                value=by_scenario.get(name,metadata.get('traffic_density'))
+                if value is None:continue
+                value=float(value)
+                if name in scenario_traffic_densities and not math.isclose(scenario_traffic_densities[name],value,abs_tol=1e-9):
+                    raise ValueError(f'专家数据集对 {name} 场景记录了不一致的背景交通密度')
+                scenario_traffic_densities[name]=value
+        scenario_traffic_densities={name:scenario_traffic_densities.get(name,float(raw.get('srairl_traffic_density',.15)))
+                                    for name in training_scenarios}
     else:
         expert_metadata=None
         training_scenarios=[]
+        scenario_traffic_densities={}
     if kind=='train' and operation=='interaction' and not expert_dataset_id:
         raise ValueError('请先选择通过质量验收的 MetaDrive 专家示范数据集')
     initialization_protocol=raw.get('srairl_initialization','canonical')
@@ -161,15 +182,15 @@ def clean_srairl_request(raw, kind):
     checked=[]
     episodes=int(raw.get('srairl_episodes',1000))
     ppo_epochs=int(raw.get('srairl_ppo_epochs',80))
-    rank_lambda=raw.get('srairl_rank_lambda',.1)
+    rank_lambda=raw.get('srairl_rank_lambda',srairl_defaults.RANK_LAMBDA)
     if isinstance(rank_lambda,bool) or not isinstance(rank_lambda,(int,float)) or not math.isfinite(rank_lambda) or not 0<=rank_lambda<=10:
         raise ValueError('SR-AIRL 偏好排序权重须在 [0, 10]')
-    seed=int(raw.get('srairl_seed',0))
+    seed=int(raw.get('srairl_seed',srairl_defaults.SEED))
     scene_seed=int(raw.get('srairl_scene_seed',seed))
     traffic_seed=int(raw.get('srairl_traffic_seed',(seed+1_000_003)%(2**32)))
     rl_seed=int(raw.get('srairl_rl_seed',seed))
     device=raw.get('srairl_device','auto')
-    if not 1<=episodes<=10_000_000 or not 1<=ppo_epochs<=1000 or not 0<=seed<2**32:
+    if not 1<=episodes<=srairl_defaults.MAX_EPISODES or not 1<=ppo_epochs<=1000 or not 0<=seed<2**32:
         raise ValueError('SR-AIRL 回合数、PPO epochs 或随机种子超出范围')
     if any(not 0<=value<2**32 for value in (scene_seed,traffic_seed,rl_seed)):
         raise ValueError('SR-AIRL scene/traffic/RL seeds must be in [0, 2^32)')
@@ -205,17 +226,16 @@ def clean_srairl_request(raw, kind):
     if scene_source=='procedural':
         # Procedural traffic is MetaDrive's IDM traffic manager, not NGSIM replay.
         reactive_background=False
-    from dataclasses import asdict
-    interaction=asdict(_srairl_interaction_template(raw,lane_num))
-    if scenario_type in ('curve','merge'):
-        for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
-            interaction[key]=min(float(interaction[key]),6.)
+    interaction=_srairl_interaction_for_scenario(raw,lane_num,scenario_type)
+    scenario_interactions={name:_srairl_interaction_for_scenario(raw,lane_num,name)
+                           for name in (training_scenarios or [scenario_type])}
     rfv_response=raw.get('srairl_rfv_response','policy')
     if rfv_response not in ('policy','fixed_speed','scripted_yield','scripted_gap_closing'):
         raise ValueError('RFV response must be policy, fixed_speed, scripted_yield or scripted_gap_closing')
     return {'srairl_scenarios':checked,'expert_dataset_id':expert_dataset_id,
             'expert_dataset_metadata':expert_metadata,'episodes':episodes,'ppo_epochs':ppo_epochs,'seed':seed,'device':device,
             'training_scenarios':training_scenarios,
+            'traffic_density_by_scenario':scenario_traffic_densities,
             'rank_lambda':float(rank_lambda),
             'model_id':str(raw.get('srairl_model_id','')),'task':'srairl','dynamics_mode':dynamics_mode,
             'operation':operation,
@@ -223,6 +243,7 @@ def clean_srairl_request(raw, kind):
             'scene_source':scene_source,'scenario':scenario_type,'lane_num':lane_num,
             'traffic_density':float(density),'horizon':horizon,'scene_seed':scene_seed,
             'interaction_scenario':interaction,'rfv_response':rfv_response,
+            'interaction_scenarios':scenario_interactions,
             'initialization_protocol':initialization_protocol,
             'traffic_seed':traffic_seed,'rl_seed':rl_seed}
 

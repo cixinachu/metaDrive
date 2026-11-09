@@ -464,11 +464,10 @@ def build_srairl_envs(scenarios,c,config):
         scenario_types=c.get('training_scenarios') or [c['scenario']]
         envs=[]
         for index,scenario_type in enumerate(scenario_types):
-            interaction=dict(c.get('interaction_scenario',{}))
-            if scenario_type in ('curve','merge'):
-                for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
-                    interaction[key]=min(float(interaction[key]),6.)
-            envs.append(SRAIRLProceduralEnv(scenario_type,c['lane_num'],c['traffic_density'],
+            interaction=dict(c.get('interaction_scenarios',{}).get(
+                scenario_type,c.get('interaction_scenario',{})))
+            traffic_density=c.get('traffic_density_by_scenario',{}).get(scenario_type,c['traffic_density'])
+            envs.append(SRAIRLProceduralEnv(scenario_type,c['lane_num'],traffic_density,
                 (c.get('scene_seed',c['seed'])+index)%(2**32),c['horizon'],c.get('srairl_view','topdown'),
                 config=config,traffic_seed=(c.get('traffic_seed')+index)%(2**32) if c.get('traffic_seed') is not None else None,
                 interaction_scenario=SRAIRLInteractionScenario(**interaction),
@@ -528,11 +527,10 @@ def train_srairl(directory,c):
         environment_count=len(scenario_types)
         def env_factory(episode):
             index=int(episode)%len(scenario_types);scenario_type=scenario_types[index]
-            interaction=dict(c.get('interaction_scenario',{}))
-            if scenario_type in ('curve','merge'):
-                for key in ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'):
-                    interaction[key]=min(float(interaction[key]),6.)
-            return SRAIRLProceduralEnv(scenario_type,c['lane_num'],c['traffic_density'],
+            interaction=dict(c.get('interaction_scenarios',{}).get(
+                scenario_type,c.get('interaction_scenario',{})))
+            traffic_density=c.get('traffic_density_by_scenario',{}).get(scenario_type,c['traffic_density'])
+            return SRAIRLProceduralEnv(scenario_type,c['lane_num'],traffic_density,
                 (c.get('scene_seed',c['seed'])+int(episode))%(2**32),c['horizon'],c.get('srairl_view','topdown'),
                 config=config,traffic_seed=(c.get('traffic_seed',c['seed'])+int(episode))%(2**32),
                 interaction_scenario=SRAIRLInteractionScenario(**interaction),
@@ -578,6 +576,7 @@ def train_srairl(directory,c):
         saved['reactive_background']=bool(c.get('srairl_reactive_background',False))
         saved['scene_source']='procedural';saved['scenario']=c.get('scenario','straight')
         saved['lane_num']=c.get('lane_num');saved['traffic_density']=c.get('traffic_density');saved['horizon']=c.get('horizon')
+        saved['traffic_density_by_scenario']=c.get('traffic_density_by_scenario',{})
         saved['interaction_scenario']=c.get('interaction_scenario');saved['rfv_response']=c.get('rfv_response','policy')
         saved['initialization_protocol']=c.get('initialization_protocol','canonical')
         saved['initial_state_samples']=[]
@@ -589,6 +588,7 @@ def train_srairl(directory,c):
                      expert_dataset_id=c.get('expert_dataset_id'),
                      scene_source='procedural',scenario=c.get('scenario','straight'),
                      lane_num=c.get('lane_num'),traffic_density=c.get('traffic_density'),
+                     traffic_density_by_scenario=c.get('traffic_density_by_scenario',{}),
                      initialization_protocol=c.get('initialization_protocol','canonical'),
                      initial_state_sample_count=len(getattr(trainer.last_env,'initial_state_samples',[])),
                      background_traffic_count=(trainer.last_env._last_info.get('traffic_vehicle_count') if hasattr(trainer.last_env,'_last_info') else None),

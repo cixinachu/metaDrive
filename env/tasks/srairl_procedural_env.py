@@ -19,13 +19,8 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
                  interaction_scenario=None, rfv_response="policy",initial_state_samples=None):
         from env.tasks.srairl_interaction import SRAIRLInteractionScenario
         if interaction_scenario is None:
-            interaction_scenario=SRAIRLInteractionScenario()
-            if scenario_type in ('curve','merge'):
-                from dataclasses import replace
-                # The generated C and ramp blocks cannot be safely tracked at
-                # canonical highway speeds inside the calibrated action range.
-                interaction_scenario=replace(interaction_scenario,elcv_speed=6.,rfv_speed=6.,
-                    rlv_current_speed=6.,rlv_target_speed=6.)
+            from env.tasks.srairl_interaction import with_scenario_speeds
+            interaction_scenario=with_scenario_speeds(SRAIRLInteractionScenario(),scenario_type)
         self.interaction_scenario=interaction_scenario.validate(lane_num)
         self.initial_state_samples=[dict(item) for item in (initial_state_samples or [])]
         if self.initial_state_samples:
@@ -99,14 +94,19 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
     def _roles_live(self):
         ego=self.world.role_vehicle("elcv")
         other=self.world.role_vehicle("rfv")
-        path=self._merge_reference_path if self._is_merge else self._source_lane_path
-        def state(vehicle):
-            result=self._path_state(vehicle,path)
-            result[1]-=self._world_path_offset
+        def state(vehicle,role):
+            if self._is_merge:
+                if role in ('elcv','rlv_current'):
+                    path=self._merge_reference_path;offset=self._world_path_offset
+                else:
+                    path=self._merge_mainline_path;offset=self._merge_mainline_offset
+            else:
+                path=self._source_lane_path;offset=self._world_path_offset
+            result=self._path_state(vehicle,path);result[1]-=offset
             return result
-        ego_state=state(ego);other_state=state(other)
-        current=state(self.world.role_vehicle('rlv_current'))
-        target=state(self.world.role_vehicle('rlv_target'))
+        ego_state=state(ego,'elcv');other_state=state(other,'rfv')
+        current=state(self.world.role_vehicle('rlv_current'),'rlv_current')
+        target=state(self.world.role_vehicle('rlv_target'),'rlv_target')
         return {"elcv":ego_state,"rfv":other_state,"rlv_current":current,"rlv_target":target}
 
     def reset(self,seed=None):
@@ -140,8 +140,12 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         self.world.spawn_interaction_roles()
         if self._is_merge:
             ego=self.world.role_vehicle('elcv')
-            self._merge_reference_path=self.world._lane_path(ego.lane)
+            self._merge_reference_path=self.world._merge_ramp_reference_path
             self._world_path_offset=self._path_state(ego,self._merge_reference_path)[1]-self.interaction_scenario.elcv_x
+            graph=self.world.current_map.road_network.graph
+            self._merge_mainline_path=self.world._lane_path(graph['>>>']['1r0_0_'][2])
+            rfv=self.world.role_vehicle('rfv')
+            self._merge_mainline_offset=self._path_state(rfv,self._merge_mainline_path)[1]-self.interaction_scenario.rfv_x
         else:
             self._source_lane_path=self.world._interaction_lane_paths[self.interaction_scenario.source_lane]
             self._target_lane_path=self.world._interaction_lane_paths[self.interaction_scenario.target_lane]
@@ -166,7 +170,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
             self._merge_start_x=float(ego.position[0])
             self._merge_complete_x=None
             self._evaluation_start_s=self._path_state(ego,self._merge_reference_path)[1]-self._world_path_offset
-            self._evaluation_end_s=self._evaluation_start_s+85.
+            self._evaluation_end_s=self._evaluation_start_s+150.
         else:
             self._evaluation_start_s=float(self.interaction_scenario.elcv_x)
             self._evaluation_end_s=float(self.interaction_scenario.interaction_end_x)
@@ -205,7 +209,7 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
             self._merge_start_x=float(ego.position[0])
             self._merge_complete_x=None
             self._evaluation_start_s=self._path_state(ego,self._merge_reference_path)[1]-self._world_path_offset
-            self._evaluation_end_s=self._evaluation_start_s+85.
+            self._evaluation_end_s=self._evaluation_start_s+150.
         else:
             ego_s=float(self._roles_live()['elcv'][1])
             self._evaluation_start_s=float(ego_s)
@@ -235,7 +239,8 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
                 vehicle=self.world.role_vehicle(role)
                 policy=IDMPolicy(vehicle,self._active_seed+index)
                 policy.enable_lane_change=False
-                target_speed={'curve':6.,'merge':6.}.get(self.scenario_type,22.)
+                target_speed=float(getattr(self.interaction_scenario,
+                    'elcv_speed' if role=='elcv' else 'rfv_speed'))
                 policy.target_speed=target_speed*3.6
                 self._warmup_policies[role]=policy
         controls={role:np.asarray(self._warmup_policies[role].act(),dtype=np.float32)

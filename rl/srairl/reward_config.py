@@ -19,3 +19,21 @@ POS_LAT_SCALE = 25.0
 POS_LONG_SCALE = 500.0
 VEL_SCALE = 80.0
 VEL_OFFSET = -40.0
+
+# The public airl.py imports reward_config.py, which is absent from the public
+# upstream tree. These explicit study values were supplied for this run.
+DT = 0.1
+VEL_MIN = VEL_OFFSET
+ACC_SCALE = 10.0
+JERK_SCALE = 20.0
+PRED_HORIZON = 1.0
+PRED_STEPS = 11
+
+# Counterfactual preference supervision.
+RANK_LAMBDA = 0.1
+RANK_TEMPERATURE = 0.1
+RANK_BATCH_SIZE = 16
+RANK_WINDOW = 20
+
+MAX_EPISODES = 100000
+SEED = 42

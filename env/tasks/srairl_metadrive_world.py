@@ -5,6 +5,96 @@ import numpy as np
 from metadrive.envs.marl_envs.multi_agent_metadrive import MultiAgentMetaDrive
 from metadrive.obs.observation_base import DummyObservation
 from metadrive.component.pgblock.first_block import FirstPGBlock
+from metadrive.component.pgblock.curve import Curve
+from metadrive.component.pgblock.ramp import InRampOnStraight
+from metadrive.component.pg_space import BlockParameterSpace, Parameter, ParameterSpace, ConstantSpace
+from metadrive.component.algorithm.blocks_prob_dist import PGBlockDistConfig
+
+
+CURVE_CENTER_RADIUS_M = 320.0
+RAMP_CENTER_RADIUS_M = 430.0
+
+
+class SRAIRLHighwayCurve(Curve):
+    """MetaDrive Curve block with a highway-scale, fixed design radius."""
+    PARAMETER_SPACE = ParameterSpace({
+        **BlockParameterSpace.CURVE,
+        Parameter.radius: ConstantSpace(CURVE_CENTER_RADIUS_M),
+    })
+
+
+class SRAIRLHighwayRamp(InRampOnStraight):
+    """MetaDrive merge block with a long, gradual native ramp transition."""
+    RADIUS = RAMP_CENTER_RADIUS_M
+
+
+class SRAIRLBlockDistConfig(PGBlockDistConfig):
+    @classmethod
+    def get_block(cls, block_id, version="v2"):
+        if block_id == SRAIRLHighwayCurve.ID:
+            return SRAIRLHighwayCurve
+        if block_id == SRAIRLHighwayRamp.ID:
+            return SRAIRLHighwayRamp
+        return super().get_block(block_id, version)
+
+
+class _LaneSlice:
+    """A lane interval preserving MetaDrive's lane coordinate interface."""
+    def __init__(self, lane, start_s, end_s):
+        self.lane=lane;self.start_s=float(start_s);self.length=max(0.,float(end_s)-self.start_s)
+        self.index=lane.index;self.width=getattr(lane,"width",3.5)
+
+    def position(self,s,lateral=0.):
+        return self.lane.position(self.start_s+float(s),lateral)
+
+    def heading_theta_at(self,s):
+        return self.lane.heading_theta_at(self.start_s+float(s))
+
+    def local_coordinates(self,position):
+        s,lateral=self.lane.local_coordinates(position)
+        return float(s)-self.start_s,float(lateral)
+
+
+class _LaneTransition:
+    """Smooth centerline through MetaDrive's native auxiliary-lane taper."""
+    def __init__(self, source, source_s, target, target_s, length=24., samples=501):
+        self.source=source;self.source_s=float(source_s);self.target=target
+        self.target_s=float(target_s);self.width=3.5
+        self.index=("merge-transition","merge-transition",2)
+        p0=np.asarray(source.position(self.source_s,0.),dtype=float)
+        p1=np.asarray(target.position(self.target_s,0.),dtype=float)
+        h0=float(source.heading_theta_at(self.source_s));h1=float(target.heading_theta_at(self.target_s))
+        self.length=float(target_s)-float(source_s)
+        chord=max(float(np.linalg.norm(p1-p0)),self.length)
+        t=np.linspace(0.,1.,int(samples))
+        c1=p0+np.asarray([np.cos(h0),np.sin(h0)])*(chord/3.)
+        c2=p1-np.asarray([np.cos(h1),np.sin(h1)])*(chord/3.)
+        points=((1-t)**3)[:,None]*p0+3*((1-t)**2*t)[:,None]*c1+3*((1-t)*t**2)[:,None]*c2+(t**3)[:,None]*p1
+        self._arc=np.concatenate(([0.],np.cumsum(np.linalg.norm(np.diff(points,axis=0),axis=1))))
+        self._arc_length=float(self._arc[-1]);self.length=float(target_s)-float(source_s);self._points=points
+        self._headings=np.unwrap(np.arctan2(np.gradient(points[:,1]),np.gradient(points[:,0])))
+
+    def _sample(self,s):
+        distance=float(np.clip(s,0.,self.length))*self._arc_length/max(self.length,1e-8)
+        x=np.interp(distance,self._arc,self._points[:,0]);y=np.interp(distance,self._arc,self._points[:,1])
+        heading=float(np.interp(distance,self._arc,self._headings))
+        return np.asarray([x,y]),heading
+
+    def position(self,s,lateral=0.):
+        point,heading=self._sample(s)
+        right=np.asarray([np.sin(heading),-np.cos(heading)])
+        return point+float(lateral)*right
+
+    def heading_theta_at(self,s):
+        return self._sample(s)[1]
+
+    def local_coordinates(self,position):
+        point=np.asarray(position,dtype=float)[:2]
+        distances=np.linalg.norm(self._points-point[None,:],axis=1)
+        index=int(np.argmin(distances));center=self._points[index]
+        heading=float(self._headings[index]);right=np.asarray([np.sin(heading),-np.cos(heading)])
+        logical_s=float(self._arc[index])*self.length/max(self._arc_length,1e-8)
+        return logical_s,float((point-center)@right)
 
 
 class SRAIRLMetaDriveWorld(MultiAgentMetaDrive):
@@ -144,7 +234,10 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         # road for the required post-manoeuvre trajectory horizon.
         # Keep enough generated road after the interaction zone for the full
         # 20-frame warm-up plus a 100-step future demonstration window.
-        map_code={"straight":"S"*12, "curve":"C"*12, "merge":"r"+"S"*12}.get(scenario_type)
+        # Two large-radius native curve blocks provide a sustained bend without
+        # turning the map into repeated tight hairpins. Merge keeps MetaDrive's
+        # actual on-ramp block, with its radius enlarged to the designed value.
+        map_code={"straight":"S"*12, "curve":"CC"+"S"*10, "merge":"r"+"S"*12}.get(scenario_type)
         if map_code is None:
             raise ValueError(f"SR-AIRL interaction map is not validated: {scenario_type}")
         if lane_num < 2:
@@ -166,7 +259,10 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
                 "agent0":dict(spawn_lane_index=("1r1_2_","1r1_3_",0),spawn_longitude=4.,
                            spawn_velocity=(self.interaction_scenario.elcv_speed,0.),spawn_velocity_car_frame=True,
                            max_speed_km_h=130,use_special_color=True,show_navi_mark=False,show_dest_mark=False),
-                "agent1":dict(spawn_lane_index=(">>>","1r0_0_",2),spawn_longitude=25.,
+                # Place the target-lane follower far enough ahead to reach the
+                # merge point before the ramp actor; its logical Frenet x is
+                # re-centered against the interaction template below.
+                "agent1":dict(spawn_lane_index=(">>>","1r0_0_",2),spawn_longitude=60.,
                            spawn_velocity=(self.interaction_scenario.rfv_speed,0.),spawn_velocity_car_frame=True,
                            max_speed_km_h=130,use_special_color=True,show_navi_mark=False,show_dest_mark=False),
             }
@@ -188,6 +284,7 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
             "crash_done":False,"out_of_road_done":False,
             "traffic_density":float(traffic_density),"random_traffic":False,
             "map":map_code,"map_config":{"lane_num":int(lane_num),"lane_width":3.5,"exit_length":50.},
+            "block_dist_config":SRAIRLBlockDistConfig,
             # The wrapper terminates its own rollout one step before MetaDrive
             # truncation so both controlled agents remain available for the
             # final observation and collision accounting.
@@ -284,25 +381,46 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         return self.interaction_vehicles
 
     def _lane_path(self,start_lane,max_edges=64):
-        """Follow a generated map's forward road graph in the same lane index."""
+        """Follow the geometrically connected lane through the generated graph."""
         graph=self.current_map.road_network.graph;path=[start_lane];visited={tuple(start_lane.index)}
-        lane_index=int(start_lane.index[-1])
         for _ in range(max_edges-1):
-            node=path[-1].index[1];outgoing=graph.get(node,{})
+            current=path[-1];node=current.index[1];outgoing=graph.get(node,{})
+            end=np.asarray(current.position(float(current.length),0.),dtype=float)
+            h0=float(current.heading_theta_at(max(0.,float(current.length)-.1)))
             choices=[]
-            for next_node,lanes in outgoing.items():
-                if not lanes:continue
-                lane=lanes[min(lane_index,len(lanes)-1)]
-                key=tuple(lane.index)
-                if key in visited:continue
-                current=path[-1];s=max(0.,current.length-.1)
-                h0=float(current.heading_theta_at(s));h1=float(lane.heading_theta_at(.1))
-                alignment=float(np.cos(h1-h0))
-                if alignment>.25:choices.append((alignment,lane))
+            for lanes in outgoing.values():
+                for lane in lanes:
+                    if tuple(lane.index) in visited:continue
+                    start=np.asarray(lane.position(0.,0.),dtype=float)
+                    h1=float(lane.heading_theta_at(min(.1,float(lane.length))))
+                    alignment=float(np.cos(h1-h0));gap=float(np.linalg.norm(start-end))
+                    if alignment>.25:
+                        choices.append((gap+10.*(1.-alignment),gap,lane))
             if not choices:break
-            lane=max(choices,key=lambda item:item[0])[1]
+            _,gap,lane=min(choices,key=lambda item:item[0])
+            if gap>2.0:break
             path.append(lane);visited.add(tuple(lane.index))
         return path
+
+    @staticmethod
+    def _compose_merge_reference_path(ramp_path,mainline_path,transition_length=24.):
+        """Join the taper-ending ramp lane to its adjacent mainline lane smoothly."""
+        if len(ramp_path)<1 or len(mainline_path)<2:
+            raise RuntimeError("MetaDrive merge map is missing its ramp or mainline lanes")
+        source=ramp_path[-1];target=mainline_path[1]
+        if source.index[1]!=target.index[1]:
+            raise RuntimeError("MetaDrive ramp taper and mainline do not share the expected merge node")
+        length=min(float(transition_length),float(source.length),float(target.length))
+        source_start=float(source.length)-length
+        target_start=source_start
+        composed=list(ramp_path[:-1])
+        if source_start>1e-6:composed.append(_LaneSlice(source,0.,source_start))
+        composed.append(_LaneTransition(source,source_start,target,target_start+length,length))
+        target_end=target_start+length
+        if target_end<float(target.length)-1e-6:
+            composed.append(_LaneSlice(target,target_end,float(target.length)))
+        composed.extend(mainline_path[2:])
+        return composed
 
     def _spawn_merge_roles(self,ReplayVehicle,vehicle_class_to_type,vehicle_type):
         """Place explicit ramp and mainline leaders on MetaDrive's connected ramp graph."""
@@ -310,16 +428,24 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         graph=self.current_map.road_network.graph
         self.interaction_vehicles={};self._interaction_elapsed=0.;self._interaction_paths={}
         ego=self.role_vehicle('elcv')
-        ramp=self._lane_path(ego.lane)
-        ego_local,_=ego.lane.local_coordinates(ego.position[:2])
-        current_leader_s=float(ego_local)+max(12.,self.interaction_scenario.rlv_current_x-
-                                                    self.interaction_scenario.elcv_x)
+        ramp_native=self._lane_path(ego.lane)
         mainline=self._lane_path(graph['>>>']['1r0_0_'][2])
+        ramp=self._compose_merge_reference_path(ramp_native,mainline)
+        self._merge_ramp_reference_path=ramp
+        transition_index=next(i for i,lane in enumerate(ramp) if isinstance(lane,_LaneTransition))
+        self._merge_transition_end_s=sum(float(lane.length) for lane in ramp[:transition_index+1])
+        ego_path_s=self._path_distance(ramp,ego.position[:2])
+        current_leader_s=ego_path_s+max(12.,self.interaction_scenario.rlv_current_x-
+                                             self.interaction_scenario.elcv_x)
+        rfv=self.role_vehicle('rfv')
+        rfv_path_s=self._path_distance(mainline,rfv.position[:2])
+        mainline_offset=rfv_path_s-float(self.interaction_scenario.rfv_x)
         # Keep the current-lane leader on the same continuous ramp-to-mainline
         # route as ELCV; the target-lane leader and RFV share the mainline.
         placements={
             'rlv_current':(ramp,current_leader_s,self.interaction_scenario.rlv_current_speed),
-            'rlv_target':(mainline,self.interaction_scenario.rlv_target_x,self.interaction_scenario.rlv_target_speed),
+            'rlv_target':(mainline,self.interaction_scenario.rlv_target_x+mainline_offset,
+                          self.interaction_scenario.rlv_target_speed),
         }
         for role,(path,s0,speed) in placements.items():
             lane,local=self._path_position(path,s0)
@@ -352,17 +478,45 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         lane=path[-1]
         return lane,float(lane.length)
 
+    @staticmethod
+    def _path_distance(path,position):
+        offset=0.
+        best=(float('inf'),0.)
+        for lane in path:
+            local,_=lane.local_coordinates(position)
+            clipped=float(np.clip(local,0.,lane.length))
+            center=np.asarray(lane.position(clipped,0.),dtype=float)
+            distance=float(np.linalg.norm(np.asarray(position,dtype=float)[:2]-center))
+            if distance<best[0]:best=(distance,offset+clipped)
+            offset+=float(lane.length)
+        return float(best[1])
+
     def advance_interaction_roles(self,dt):
         spec=self.interaction_scenario
         self._interaction_elapsed+=float(dt)
         if self.scenario_type == "merge":
             for role,(path,s0,speed) in self._interaction_paths.items():
-                lane,local=self._path_position(path,s0+speed*self._interaction_elapsed)
+                elapsed=self._interaction_elapsed
+                current_speed=float(speed)
+                if role=="rlv_current":
+                    # The ramp leader follows the native taper, then accelerates
+                    # smoothly to mainline speed after entering the mainline.
+                    merge_time=max(0.,(self._merge_transition_end_s-float(s0))/float(speed))
+                    after=max(0.,elapsed-merge_time);accel=1.0
+                    accel_duration=max(0.,(float(spec.rlv_target_speed)-float(speed))/accel)
+                    accelerated=min(after,accel_duration)
+                    distance=(float(speed)*min(elapsed,merge_time)+float(speed)*accelerated+
+                              .5*accel*accelerated*accelerated+
+                              float(spec.rlv_target_speed)*max(0.,after-accel_duration))
+                    current_speed=min(float(spec.rlv_target_speed),float(speed)+accel*after)
+                else:
+                    distance=float(speed)*elapsed
+                lane,local=self._path_position(path,float(s0)+distance)
                 position=lane.position(local,0.);heading=float(lane.heading_theta_at(local))
                 vehicle=self.interaction_vehicles[role]
                 vehicle.set_position((float(position[0]),float(position[1])))
                 vehicle.set_heading_theta(heading)
-                vehicle.recorded_velocity=np.asarray([speed*np.cos(heading),speed*np.sin(heading)])
+                vehicle.recorded_velocity=np.asarray([current_speed*np.cos(heading),current_speed*np.sin(heading)])
                 vehicle.set_velocity(vehicle.recorded_velocity);vehicle.after_step()
             return
         for role,lane_index,x0,speed in (

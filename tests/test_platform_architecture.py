@@ -151,6 +151,12 @@ def test_social_airl_discriminator_uses_checked_upstream_reward_shape():
     assert reward.shape == private.shape == phi.shape == (3, 1)
     assert model(states, dones, log_pi, next_states).shape == (3, 1)
     assert torch.allclose(reward, private - model.alpha * phi)
+    assert model.discriminator_logits(states, dones, log_pi, next_states).shape == (3, 1)
+    assert torch.allclose(model.calculate_policy_reward(states,dones,log_pi,next_states),
+                          model.discriminator_logits(states,dones,log_pi,next_states))
+    model.discriminator_logits(states,dones,log_pi,next_states).sum().backward()
+    assert potential._l_long_raw.grad is not None
+    assert model.private_g.encoder[0].conv.in_channels==8
 
 
 def test_social_potential_denormalizes_velocity_with_the_supplied_offset():
@@ -262,13 +268,15 @@ def test_supplied_reward_config_values_are_the_sr_airl_defaults():
 def test_temporal_reward_and_counterfactual_preference_use_full_history():
     import torch
     from rl.srairl.config import SRAIRLConfig
-    from rl.srairl.discriminator import TemporalConvReward
+    from rl.srairl.discriminator import TemporalPrivateReward, extract_motion_features
     from rl.srairl.trainer import counterfactual_preference_mask
     cfg=SRAIRLConfig.from_mapping()
-    model=TemporalConvReward(cfg.history_len)
-    assert model(torch.zeros(2,cfg.history_len,4)).shape==(2,1)
+    model=TemporalPrivateReward()
+    features=extract_motion_features(torch.zeros(2,cfg.history_len*16),"lcv",cfg.history_len)
+    assert features.shape==(2,8,cfg.history_len)
+    assert model(features).shape==(2,1)
     with pytest.raises(ValueError,match="TCN expects"):
-        model(torch.zeros(2,4,4))
+        model(torch.zeros(2,4,cfg.history_len))
     states=torch.zeros(1,cfg.history_len,16)
     states[:,:,2]=(10.-cfg.vel_offset)/cfg.vel_scale
     states[:,-1,5]=8./cfg.pos_long_scale
@@ -298,9 +306,12 @@ def test_expert_collection_accepts_batch_of_three_metadrive_maps():
         "srairl_demo_episodes":3,"srairl_lane_num":3},"train")
     assert request["scenarios"]==["straight","curve","merge"]
     assert set(request["interaction_scenarios"])==set(request["scenarios"])
-    for scene in ('curve','merge'):
-        assert max(request['interaction_scenarios'][scene][key] for key in
-            ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'))<=6.
+    assert set(request['interaction_scenarios']['curve'][key] for key in
+        ('elcv_speed','rfv_speed','rlv_current_speed','rlv_target_speed'))=={15.}
+    assert request['interaction_scenarios']['merge']['elcv_speed']==20.
+    assert request['interaction_scenarios']['merge']['rfv_speed']==22.
+    assert request['interaction_scenarios']['merge']['rlv_current_speed']==20.
+    assert request['interaction_scenarios']['merge']['rlv_target_speed']==22.
     with pytest.raises(ValueError,match="至少需要三条"):
         clean_srairl_request({"srairl_operation":"expert_collect",
             "srairl_collect_scenarios":["merge"],"srairl_demo_episodes":3,
@@ -320,11 +331,16 @@ def test_srairl_trainer_runs_one_alternating_update_end_to_end():
         discriminator_batch_size=2, discriminator_updates=1, lambda_equilibrium=0., device="cpu")
     with tempfile.TemporaryDirectory() as temp:
         trainer = SRAIRLTrainer([env], expert, config=cfg, training_config=train_cfg, output_dir=temp)
+        optimizer_ids={id(parameter) for group in trainer.discriminator_optimizer.param_groups
+                       for parameter in group['params']}
+        assert id(trainer.shared_potential._l_long_raw) in optimizer_ids
+        assert isinstance(trainer.bce,torch.nn.BCEWithLogitsLoss)
         history = trainer.train()
         assert len(history) == 1
         assert "discriminator_loss" in history[0]
         assert "preference_rank_loss" in history[0]
         assert "preference_pairs_used" in history[0]
+        assert "potential_L_long_m" in history[0]
         assert trainer.episode == 1
         assert (Path(temp) / "training_state.pt").is_file()
         resumed = SRAIRLTrainer([env], expert, config=cfg, training_config=train_cfg)

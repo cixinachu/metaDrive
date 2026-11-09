@@ -1,11 +1,12 @@
-"""Social AIRL reward and discriminator, ported from the public upstream code.
-
-Math follows Step1_Reward_Recovery/airl.py at the commit pinned in UPSTREAM.md.
-The configurable constants come from the missing upstream reward_config.py.
-"""
+"""Social AIRL reward and discriminator, following the public upstream airl.py."""
 import torch
 from torch import nn
 import torch.nn.functional as F
+
+from rl.srairl.reward_config import (
+    ACC_SCALE, DT, JERK_SCALE, POS_LAT_SCALE, POS_LONG_SCALE, PRED_HORIZON,
+    PRED_STEPS, VEL_MIN, VEL_SCALE,
+)
 
 
 def build_mlp(input_dim, output_dim, hidden_units=(64, 64), hidden_activation=None, output_activation=None):
@@ -46,42 +47,91 @@ def extract_private_state(states, role, history_len=11):
     return ego
 
 
-class TemporalConvReward(nn.Module):
-    """Causal TCN over the configured per-role history (11 frames in v2)."""
-    def __init__(self, history_len, hidden=64):
-        super().__init__()
-        self.history_len=int(history_len)
-        self.input_projection=nn.Conv1d(4,hidden,kernel_size=1)
-        self.convs=nn.ModuleList(nn.Conv1d(hidden,hidden,kernel_size=3,dilation=d) for d in (1,2,4))
-        self.projections=nn.ModuleList(nn.Conv1d(hidden,hidden,kernel_size=1) for _ in self.convs)
-        self.output=nn.Sequential(nn.Linear(hidden,hidden),nn.ReLU(),nn.Linear(hidden,1))
+def extract_motion_features(states, role, history_len=11, *, dt=DT, acceleration_scale=ACC_SCALE,
+                            jerk_scale=JERK_SCALE, pos_lat_scale=POS_LAT_SCALE,
+                            pos_long_scale=POS_LONG_SCALE, vel_scale=VEL_SCALE, vel_min=VEL_MIN):
+    """Build upstream's 8-channel position/velocity/acceleration/jerk tensor."""
+    if role not in ("lcv", "fv"):
+        raise ValueError(f"Unsupported role: {role}")
+    frames = states.reshape(-1, history_len, 16)
+    lcv, fv_rel = frames[..., 0:4], frames[..., 4:8]
+    ego = lcv if role == "lcv" else lcv - fv_rel
+    position = torch.stack((ego[..., 0] * pos_lat_scale,
+                            ego[..., 1] * pos_long_scale), dim=-1)
+    velocity = ego[..., 2:4] * vel_scale + vel_min
+    relative_position = (position - position[:, :1]) / position.new_tensor(
+        (pos_lat_scale, pos_long_scale))
+    acceleration = torch.diff(velocity, dim=1, prepend=velocity[:, :1]) / float(dt)
+    jerk = torch.diff(acceleration, dim=1, prepend=acceleration[:, :1]) / float(dt)
+    features = torch.cat((relative_position, velocity / float(vel_scale),
+                          acceleration / float(acceleration_scale),
+                          jerk / float(jerk_scale)), dim=-1)
+    return features.transpose(1, 2)
 
-    def forward(self, sequence):
-        if sequence.ndim!=3 or sequence.shape[1:]!=(self.history_len,4):
-            raise ValueError(f"TCN expects [batch,{self.history_len},4], got {tuple(sequence.shape)}")
-        values=self.input_projection(sequence.transpose(1,2))
-        for conv,projection in zip(self.convs,self.projections):
-            residual=values
-            values=F.pad(values,(2*conv.dilation[0],0))
-            values=F.relu(conv(values))
-            values=projection(values)+residual
-        return self.output(values[:,:,-1])
+
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, dilation=1):
+        super().__init__()
+        self.pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size,
+                              dilation=dilation, padding=self.pad)
+
+    def forward(self, values):
+        result = self.conv(values)
+        return result[..., :-self.pad] if self.pad else result
+
+
+class TemporalPrivateReward(nn.Module):
+    """Causal three-layer TCN over eight physical motion-feature channels."""
+    def __init__(self, input_dim=8, hidden_dim=64):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            CausalConv1d(input_dim, hidden_dim, dilation=1), nn.ReLU(),
+            CausalConv1d(hidden_dim, hidden_dim, dilation=2), nn.ReLU(),
+            CausalConv1d(hidden_dim, hidden_dim, dilation=4), nn.ReLU(),
+        )
+        self.reward_head = nn.Sequential(nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+                                         nn.Linear(hidden_dim, 1))
+
+    def forward(self, features):
+        if features.ndim != 3 or features.shape[1] != 8:
+            raise ValueError(f"TCN expects [batch,8,time], got {tuple(features.shape)}")
+        return self.reward_head(self.encoder(features)[:, :, -1])
 
 
 class AnisotropicInteractionPotential(nn.Module):
     """Shared explicit interaction potential from upstream SocialAIRL."""
     def __init__(self, L_long, L_lat, dir_lambda, *, pos_lat_scale=25.0, pos_long_scale=500.0,
-                 vel_scale=80.0, vel_offset=-40.0):
+                 vel_scale=80.0, vel_offset=-40.0, prediction_horizon=PRED_HORIZON,
+                 prediction_steps=PRED_STEPS, prediction_dt=DT):
         super().__init__()
         if min(float(L_long), float(L_lat)) <= 0 or not 0 <= float(dir_lambda) <= 1:
             raise ValueError("invalid interaction-potential parameters")
-        self.L_long = float(L_long)
-        self.L_lat = float(L_lat)
-        self.dir_lambda = float(dir_lambda)
+        self._l_long_raw = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(L_long)))) )
+        self._l_lat_raw = nn.Parameter(torch.log(torch.expm1(torch.tensor(float(L_lat)))) )
+        bounded = torch.tensor(float(dir_lambda)).clamp(1e-4, 1.0 - 1e-4)
+        self._dir_lambda_raw = nn.Parameter(torch.logit(bounded))
         if min(float(pos_lat_scale),float(pos_long_scale),float(vel_scale))<=0:
             raise ValueError("invalid observation normalization scales")
         self.pos_lat_scale=float(pos_lat_scale);self.pos_long_scale=float(pos_long_scale)
         self.vel_scale=float(vel_scale);self.vel_offset=float(vel_offset)
+        if float(prediction_horizon) <= 0 or int(prediction_steps) < 1 or float(prediction_dt) <= 0:
+            raise ValueError("interaction prediction horizon and sample count must be positive")
+        self.prediction_horizon=float(prediction_horizon)
+        self.prediction_steps=int(prediction_steps)
+        self.prediction_dt=float(prediction_dt)
+
+    @property
+    def L_long(self):
+        return F.softplus(self._l_long_raw).clamp_min(1e-3)
+
+    @property
+    def L_lat(self):
+        return F.softplus(self._l_lat_raw).clamp_min(1e-3)
+
+    @property
+    def dir_lambda(self):
+        return torch.sigmoid(self._dir_lambda_raw)
 
     def _physical_state(self,x):
         lat = x[:, 0] * self.pos_lat_scale
@@ -92,17 +142,27 @@ class AnisotropicInteractionPotential(nn.Module):
 
     def pair_potential(self, target, neighbor):
         lat_i, lon_i, v_long_i, v_lat_i = self._physical_state(target)
-        lat_j, lon_j, _, _ = self._physical_state(neighbor)
+        lat_j, lon_j, v_long_j, v_lat_j = self._physical_state(neighbor)
         d_long, d_lat = lon_j - lon_i, lat_j - lat_i
+        rel_long, rel_lat = v_long_j - v_long_i, v_lat_j - v_lat_i
         psi = torch.atan2(v_lat_i, v_long_i)
         cos_psi, sin_psi = torch.cos(psi), torch.sin(psi)
-        dx_e = cos_psi * d_long + sin_psi * d_lat
-        dy_e = -sin_psi * d_long + cos_psi * d_lat
-        q = (dx_e / self.L_long) ** 2 + (dy_e / self.L_lat) ** 2
-        spatial = torch.exp(-0.5 * q)
-        phi = torch.atan2(dy_e, dx_e)
-        direction_weight = self.dir_lambda + (1.0 - self.dir_lambda) * (1.0 + torch.cos(phi)) / 2.0
-        return direction_weight * spatial
+        x0 = cos_psi * d_long + sin_psi * d_lat
+        y0 = -sin_psi * d_long + cos_psi * d_lat
+        vx = cos_psi * rel_long + sin_psi * rel_lat
+        vy = -sin_psi * rel_long + cos_psi * rel_lat
+        horizon = torch.linspace(self.prediction_dt, self.prediction_horizon, self.prediction_steps,
+                                 device=target.device, dtype=target.dtype)
+        x_pred = x0[:, None] + vx[:, None] * horizon
+        y_pred = y0[:, None] + vy[:, None] * horizon
+        q = (x_pred / self.L_long).square() + (y_pred / self.L_lat).square()
+        spatial = torch.exp(-q)
+        distance = torch.linalg.vector_norm(torch.stack((x_pred,y_pred),dim=-1),dim=-1)
+        cos_phi = torch.where(distance > 1e-4,
+                              x_pred / distance.clamp_min(1e-4),
+                              torch.ones_like(distance))
+        direction_weight = self.dir_lambda + (1.0 - self.dir_lambda) * (1.0 + cos_phi) / 2.0
+        return (direction_weight * spatial).mean(dim=1)
 
     def forward(self, states, role="lcv"):
         vehicles = split_latest_state(states)
@@ -120,7 +180,8 @@ class AnisotropicInteractionPotential(nn.Module):
 class SocialAIRLDiscrim(nn.Module):
     """Two-actor AIRL discriminator using upstream r_private - alpha*phi."""
     def __init__(self, state_shape, gamma, shared_interaction_potential, alpha_init,
-                 hidden_units_r=(64, 64), hidden_units_v=(64, 64), role="lcv", history_len=None):
+                 hidden_units_r=(64, 64), hidden_units_v=(64, 64), role="lcv", history_len=None,
+                 dt=DT, acceleration_scale=ACC_SCALE, jerk_scale=JERK_SCALE):
         super().__init__()
         if role not in ("lcv", "fv"):
             raise ValueError(f"Unsupported role: {role}")
@@ -132,7 +193,13 @@ class SocialAIRLDiscrim(nn.Module):
             raise ValueError("alpha_init and gamma must be positive (gamma <= 1)")
         self.role, self.history_len, self.gamma = role, int(history_len), float(gamma)
         self.interaction_potential = shared_interaction_potential
-        self.private_g = TemporalConvReward(history_len)
+        self.motion_feature_config={
+            "dt":float(dt),"acceleration_scale":float(acceleration_scale),
+            "jerk_scale":float(jerk_scale),"pos_lat_scale":shared_interaction_potential.pos_lat_scale,
+            "pos_long_scale":shared_interaction_potential.pos_long_scale,
+            "vel_scale":shared_interaction_potential.vel_scale,"vel_min":shared_interaction_potential.vel_offset,
+        }
+        self.private_g = TemporalPrivateReward()
         self.h = build_mlp(state_shape, 1, hidden_units_v, nn.ReLU(inplace=True))
         alpha = torch.tensor(float(alpha_init))
         self.alpha_raw = nn.Parameter(torch.log(torch.expm1(alpha)))
@@ -142,8 +209,9 @@ class SocialAIRLDiscrim(nn.Module):
         return F.softplus(self.alpha_raw)
 
     def get_reward(self, states):
-        private_state = extract_private_state(states, self.role, self.history_len)
-        r_private = self.private_g(private_state)
+        motion_features = extract_motion_features(states, self.role, self.history_len,
+                                                   **self.motion_feature_config)
+        r_private = self.private_g(motion_features)
         phi = self.interaction_potential(states, role=self.role)
         return r_private - self.alpha * phi, r_private, phi
 
@@ -152,10 +220,15 @@ class SocialAIRLDiscrim(nn.Module):
         done = dones.reshape(-1, 1).float()
         return reward + self.gamma * (1.0 - done) * self.h(next_states) - self.h(states)
 
-    def forward(self, states, dones, log_pis, next_states):
-        logits = torch.clamp(self.f(states, dones, next_states) - log_pis.unsqueeze(-1), -50.0, 50.0)
-        return torch.sigmoid(logits)
+    def discriminator_logits(self, states, dones, log_pis, next_states):
+        return self.f(states, dones, next_states) - log_pis.reshape(-1, 1)
 
-    def calculate_reward(self, states, dones=None, log_pis=None, next_states=None):
+    def forward(self, states, dones, log_pis, next_states):
+        return torch.sigmoid(self.discriminator_logits(states, dones, log_pis, next_states))
+
+    def calculate_policy_reward(self, states, dones, log_pis, next_states):
         with torch.no_grad():
-            return self.get_reward(states)[0]
+            return self.discriminator_logits(states, dones, log_pis, next_states)
+
+    # Retain the public method name used by older local callers.
+    calculate_reward = calculate_policy_reward

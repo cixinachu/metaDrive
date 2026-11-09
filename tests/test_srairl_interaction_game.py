@@ -145,7 +145,7 @@ def test_metadrive_ramp_and_mainline_share_conflict_route_and_no_false_merge_suc
         if env.action_adapter.calibration is not None:
             from datasets.srairl.metadrive_expert import MetaDriveExpertController
             env.rfv_response='fixed_speed';env.reset(seed=4)
-            teacher=MetaDriveExpertController(env,desired_speed=6.)
+            teacher=MetaDriveExpertController(env)
             for _ in range(100):
                 _,info=env.step({role:teacher.action(role) for role in ('elcv','rfv')})
                 if info['done']:break
@@ -178,3 +178,39 @@ def test_ngsim_initial_state_distribution_reconfigures_each_meta_drive_episode()
         assert selected=={1.,2.}
     finally:
         env.close()
+
+
+def test_metadrive_expert_archive_serializes_tracking_errors_and_episode_splits(tmp_path):
+    import json
+    from datasets.srairl.expert_builder import ExpertTransition,save_transitions
+    from datasets.srairl.native_windows import native_dataset_info
+
+    transitions=[];raw_episodes=[]
+    for seed in (10,11,12):
+        scenario_id=f'metadrive-straight-seed{seed}'
+        state=np.zeros(16*11,dtype=np.float32)
+        transitions.extend([
+            ExpertTransition(state,np.zeros(2,dtype=np.float32),state,True,role,scenario_id,0)
+            for role in ('elcv','rfv')])
+        raw_episodes.append({
+            'role_order':['elcv','rfv','rlv_current','rlv_target'],
+            'role_states':np.zeros((121,4,4),dtype=np.float64),
+            'reference_states_frenet':np.zeros((121,4,4),dtype=np.float64),
+            'lane_indices':[['a/b/0']*4 for _ in range(121)],
+            'times_s':np.arange(121,dtype=np.float64)*.1,
+            'desired_acceleration':np.zeros((100,2,2),dtype=np.float32),
+            'metadrive_actions':np.zeros((100,2,2),dtype=np.float32),
+            'actual_acceleration':np.zeros((100,2,2),dtype=np.float32),
+            'tracking_errors':np.zeros((100,2,2),dtype=np.float32),
+            'warmup_steps':20,'scenario':'straight','seed':seed,
+            'validation':{'valid':True,'errors':[]},
+        })
+    path=tmp_path/'experts.npz'
+    save_transitions(path,transitions,{'source':'MetaDrive'},raw_episodes)
+    with np.load(path,allow_pickle=False) as archive:
+        assert archive['trajectory_tracking_errors'].shape==(300,2,2)
+        episode_metadata=json.loads(str(archive['trajectory_metadata'].item()))
+        assert len(episode_metadata)==3
+        assert all('tracking_errors' not in row for row in episode_metadata)
+    info=native_dataset_info(path)
+    assert set(info['windows_by_scenario']['straight'])=={'train','validation','test'}
