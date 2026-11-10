@@ -86,10 +86,14 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
 
     def _vehicle_pool(self):
         vehicles=list(self.world.agents.values())
-        vehicles.extend(v for v in getattr(self.world,'interaction_vehicles',{}).values() if v not in vehicles)
+        vehicles.extend(getattr(self.world,'interaction_vehicles',{}).values())
         manager=self.world.engine.traffic_manager
-        vehicles.extend(v for v in getattr(manager,"traffic_vehicles",[]) if v not in vehicles)
-        return vehicles
+        vehicles.extend(getattr(manager,"traffic_vehicles",[]))
+        # Trigger-mode traffic is spawned before it is activated. Those bodies
+        # can already obstruct the ramp, so perception must include them too.
+        spawned=getattr(manager,'spawned_objects',None) or {}
+        vehicles.extend(spawned.values())
+        return list({id(vehicle):vehicle for vehicle in vehicles}.values())
 
     def _roles_live(self):
         ego=self.world.role_vehicle("elcv")
@@ -205,7 +209,8 @@ class SRAIRLProceduralEnv(SRAIRLEnv):
         self._close_warmup_policies()
         ego=self.world.role_vehicle("elcv");rfv=self.world.role_vehicle("rfv")
         self.steps=0;self.time=0.;self._done=False
-        self.max_steps+=int(warmup_steps)
+        # steps/time were reset above; the interaction budget already excludes
+        # history. The underlying world reserves those history ticks separately.
         self.distance_travelled_m=0.
         self._last_position=np.asarray(ego.position[:2],dtype=float)
         self._previous_progress=0.

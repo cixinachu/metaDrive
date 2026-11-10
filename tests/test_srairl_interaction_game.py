@@ -144,7 +144,8 @@ def test_metadrive_ramp_and_mainline_share_conflict_route_and_no_false_merge_suc
             assert not info['merge_shared_lane']
         if env.action_adapter.calibration is not None:
             from datasets.srairl.metadrive_expert import MetaDriveExpertController
-            env.rfv_response='fixed_speed';env.reset(seed=4)
+            # The gap-aware teacher owns both actors; fixed_speed bypasses its merge request.
+            env.rfv_response='policy';env.reset(seed=4)
             teacher=MetaDriveExpertController(env)
             for _ in range(300):
                 _,info=env.step({role:teacher.action(role) for role in ('elcv','rfv')})

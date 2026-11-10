@@ -63,7 +63,11 @@ class SRAIRLActionAdapter:
             lo,hi=si-1,si; w=float(np.clip((speed-speeds[lo])/(speeds[hi]-speeds[lo]),0.,1.))
             table=self.calibration['longitudinal_accel']
             measured=(1-w)*table[lo]+w*table[hi]
-            longitudinal=float(_inverse_surface(controls,measured,float(action[0])))
+            # Brake, neutral and throttle are distinct Bullet control branches.
+            # Interpolating across zero can turn a requested deceleration into
+            # positive throttle because the sampled neutral drag is discontinuous.
+            branch=controls<0 if action[0]<0 else controls>0
+            longitudinal=float(_inverse_surface(controls[branch],measured[branch],float(action[0])))
             table=self.calibration['lateral_accel']
             measured=(1-w)*table[lo]+w*table[hi]
             steering=float(_inverse_surface(controls,measured,float(action[1])))

@@ -597,13 +597,23 @@ def collect_srairl_expert(directory,c):
     """Generate reusable MetaDrive teacher trajectories for SR-AIRL training."""
     from datasets.srairl.expert_builder import save_transitions
     from datasets.srairl.metadrive_expert import collect_metadrive_expert,save_raw_episode
+    from datasets.srairl.teacher_controller import TEACHER_VERSION
+    c={**c,'expert_controller':TEACHER_VERSION}
     from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
     from env.tasks.srairl_interaction import SRAIRLInteractionScenario
     recorder=Recorder(directory)
     try:
-        transitions=[];episodes=[];raw_episodes=[]
+        transitions=[];episodes=[];raw_episodes=[];accepted_raw=[]
+        simulated_steps=0
         scenario_types=c.get('scenarios') or [c['scenario']]
+        total_episodes=c['demo_episodes']*len(scenario_types)
         for scenario_index,scenario_type in enumerate(scenario_types):
+            if (directory/'STOP').exists():break
+            scene_seed=c['seed']+scenario_index*100_000
+            atomic_json(directory/'status.json',dict(state='running',kind='train',phase='initializing',
+                step=len(episodes),episodes=len(episodes),total=total_episodes,device='cpu',
+                scenario=scenario_type,scene_seed=scene_seed))
+            print(f'专家采集：{scenario_type}，密度 {c["traffic_density"]}，种子 {scene_seed}，计划 {c["demo_episodes"]} 回合',flush=True)
             interaction_values=c.get('interaction_scenarios',{}).get(
                 scenario_type,c.get('interaction_scenario',{}))
             env=SRAIRLProceduralEnv(scenario_type,c['lane_num'],c['traffic_density'],
@@ -613,7 +623,16 @@ def collect_srairl_expert(directory,c):
                 interaction_scenario=(SRAIRLInteractionScenario(**interaction_values)
                     if interaction_values else None))
             try:
+                last_episode_step=[None,0]
                 def report(state):
+                    nonlocal simulated_steps
+                    state=dict(state)
+                    if 'episode_step' in state:
+                        local_episode=int(state.get('episodes',0))
+                        if last_episode_step[0]!=local_episode:last_episode_step[:]=[local_episode,0]
+                        current_step=int(state['episode_step'])
+                        simulated_steps+=max(0,current_step-last_episode_step[1])
+                        last_episode_step[1]=current_step
                     if 'episode_step' in state:
                         info=env._last_info
                         recorder.write({'demo/speed_elcv_mps':float(env.world.role_vehicle('elcv').speed),
@@ -625,25 +644,38 @@ def collect_srairl_expert(directory,c):
                             'demo/lane_change_completed':float(info.get('lane_change_completed',False)),
                             'demo/target_gap_m':float(info.get('target_gap_m',0.)),
                             'demo/delta_v_rfv_mps':float(info.get('delta_v_rfv_mps',0.))},
-                            step=int(state.get('global_steps',0)))
+                            step=simulated_steps)
+                    state.update(kind='train',device='cpu',phase='collecting',
+                        step=len(episodes)+int(state.get('episodes',0)),
+                        episodes=len(episodes)+int(state.get('episodes',0)),
+                        total=total_episodes,global_steps=simulated_steps,scene_seed=scene_seed)
                     state['scenario']=scenario_type
                     state['scenario_index']=scenario_index
                     atomic_json(directory/'status.json',state)
                     return not (directory/'STOP').exists()
                 current_transitions,current_episodes,current_raw=collect_metadrive_expert(
                     env,c['demo_episodes'],(c['seed']+scenario_index*100_000)%(2**32),report,vary_initial_state=True)
-                transitions.extend(current_transitions);episodes.extend(current_episodes);raw_episodes.extend(current_raw)
+                # Persist each finished scene before starting the next one.
+                for row,raw_episode in zip(current_episodes,current_raw):
+                    index=len(raw_episodes)+1
+                    accepted=bool(raw_episode.get('validation',{}).get('valid'))
+                    relative=Path('expert_episodes' if accepted else 'failed_episodes')/f'episode_{index:05d}.npz'
+                    save_raw_episode(directory/relative,raw_episode)
+                    row.update(scenario=scenario_type,episode=index,episode_file=str(relative))
+                    with (directory/'episodes.jsonl').open('a') as stream:
+                        stream.write(json.dumps(row,allow_nan=False)+'\n')
+                    raw_episodes.append(raw_episode)
+                    if accepted:accepted_raw.append(raw_episode)
+                transitions.extend(current_transitions);episodes.extend(current_episodes)
+                print(f'{scenario_type} 已结束：尝试 {len(current_episodes)}，合格 {sum(bool(row["accepted"]) for row in current_episodes)}',flush=True)
             finally:env.close()
-        accepted_raw=[]
-        for index,raw_episode in enumerate(raw_episodes,1):
-            accepted=bool(raw_episode.get('validation',{}).get('valid'))
-            target=directory/('expert_episodes' if accepted else 'failed_episodes')/f"episode_{index:05d}.npz"
-            save_raw_episode(target,raw_episode)
-            if accepted:accepted_raw.append(raw_episode)
         if not transitions:
             atomic_json(directory/'summary.json',dict(task='srairl_expert_collection',source='MetaDrive',
                 scenario=c['scenario'],episodes=len(episodes),accepted_episodes=0,
                 rejected_episodes=len(episodes),episode_records='failed_episodes/'))
+            if (directory/'STOP').exists():
+                return dict(state='stopped',kind='train',step=len(episodes),total=total_episodes,
+                    episodes=len(episodes),global_steps=simulated_steps,device='cpu')
             raise RuntimeError('没有示范回合通过验收；不合格原始回合已保存在 failed_episodes/')
         dataset_path=directory/'expert_transitions.npz'
         saved_dataset=ROOT/'datasets'/'srairl'/'metadrive'/f"{directory.name}.npz"
@@ -660,22 +692,26 @@ def collect_srairl_expert(directory,c):
             raw_episodes=accepted_raw)
         import shutil
         shutil.copy2(saved_dataset,dataset_path)
-        with (directory/'episodes.jsonl').open('a') as f:
-            for row in episodes:f.write(json.dumps(row,allow_nan=False)+'\n')
         summary=dict(task='srairl_expert_collection',source='MetaDrive',scene_source='procedural',
             scenario=c['scenario'],scenarios=scenario_types,lane_num=c['lane_num'],traffic_density=c['traffic_density'],
             horizon=c['horizon'],seed=c['seed'],episodes=len(episodes),accepted_episodes=len(accepted_raw),
             rejected_episodes=len(episodes)-len(accepted_raw),transition_pairs=pair_count,
             interaction_scenario=c.get('interaction_scenario'),
             transitions=len(transitions),expert_controller=c['expert_controller'],
+            simulated_interaction_steps=simulated_steps,
+            teacher_outcome_counts={name:sum(row.get('teacher_outcome','unknown')==name for row in episodes)
+                for name in sorted({row.get('teacher_outcome','unknown') for row in episodes})},
+            episodes_by_scenario={name:dict(attempted=sum(row['scenario']==name for row in episodes),
+                accepted=sum(row['scenario']==name and row['accepted'] for row in episodes),
+                rejected=sum(row['scenario']==name and not row['accepted'] for row in episodes)) for name in scenario_types},
             controller_interpretation='Rule-based ELCV gap acceptance and RFV headway-response teacher; a scripted demonstration source, not an optimal or human expert.',
             background_traffic='MetaDrive IDM traffic manager',dataset_file='expert_transitions.npz',
             reusable_dataset=str(saved_dataset.relative_to(ROOT)),
             dynamics_mode='metadrive_physics')
         atomic_json(directory/'summary.json',summary)
         state='stopped' if (directory/'STOP').exists() else 'completed'
-        return dict(state=state,kind='train',step=len(episodes),total=c['demo_episodes'],episodes=len(episodes),
-            global_steps=pair_count,device='cpu')
+        return dict(state=state,kind='train',step=len(episodes),total=total_episodes,episodes=len(episodes),
+            global_steps=simulated_steps,device='cpu')
     finally:
         recorder.close()
 
@@ -1071,6 +1107,20 @@ def main():
     torch.set_num_threads(1)
     atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
     try:
+        if job.get('task')=='srairl' and kind=='preview':
+            from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
+            from env.tasks.srairl_interaction import SRAIRLInteractionScenario
+            env=SRAIRLProceduralEnv(c['scenario'],c['lane_num'],c['traffic_density'],c['seed'],
+                c['horizon'],c['srairl_view'],traffic_seed=c['traffic_seed'],
+                interaction_scenario=SRAIRLInteractionScenario(**c['interaction_scenario']))
+            try:
+                env.reset(seed=c['seed'])
+                pixels=render_srairl_frame(directory,env,env._last_info)
+                Image.fromarray(pixels).save(directory/'frame.tmp.jpg',quality=85)
+                (directory/'frame.tmp.jpg').replace(directory/'frame.jpg')
+                atomic_json(directory/'status.json',dict(state='completed',kind='preview',step=0))
+            finally:env.close()
+            return
         if job.get('task')=='evaluation':
             from env.tasks.srairl_interaction import SRAIRLInteractionScenario
             from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv

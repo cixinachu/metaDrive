@@ -4,13 +4,56 @@ import json
 from pathlib import Path
 import sys
 from dataclasses import replace
+import math
+import threading
+import time
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from env.tasks.srairl_metadrive_world import SRAIRLProceduralWorld
+class DiagnosticProgress:
+    """Flush progress to stderr, including during slow imports and map resets."""
+    def __init__(self, interval=5.):
+        self.interval=interval;self.started=time.monotonic();self.last_print=self.started
+        self.message="准备启动";self.lock=threading.Lock();self.stopped=threading.Event()
+
+    def update(self,message,force=False):
+        with self.lock:
+            self.message=message
+            now=time.monotonic()
+            if force or now-self.last_print>=self.interval:
+                print(f"[{now-self.started:7.1f}s] {message}",file=sys.stderr,flush=True)
+                self.last_print=now
+
+    def _heartbeat(self):
+        while not self.stopped.wait(min(1.,self.interval)):
+            with self.lock:
+                now=time.monotonic()
+                if now-self.last_print>=self.interval:
+                    print(f"[{now-self.started:7.1f}s] 等待中：{self.message}",file=sys.stderr,flush=True)
+                    self.last_print=now
+
+    def __enter__(self):
+        self.thread=threading.Thread(target=self._heartbeat,daemon=True)
+        self.thread.start();return self
+
+    def __exit__(self,*exc):
+        self.stopped.set();self.thread.join(timeout=1.)
+
+
+def collection_progress(progress,scenario,speed,total):
+    def callback(state):
+        if 'episode_step' in state:
+            progress.update(f"{scenario} {speed:g} m/s | 回合 {state['episodes']+1}/{total} | 仿真步 {state['episode_step']}")
+        elif 'episode_steps' in state:
+            progress.update(f"{scenario} {speed:g} m/s | 回合 {state['episodes']}/{total} 完成 | "
+                f"步数 {state['episode_steps']} | 碰撞={state['collision']} 越界={state['out_of_road']}",force=True)
+        else:
+            progress.update(f"{scenario} {speed:g} m/s | 回合 {state['episodes']+1}/{total} | 初始化地图及车辆、采集历史帧",force=True)
+        return True
+    return callback
 
 
 def lane_curvature(lane, samples=400):
@@ -67,9 +110,31 @@ def main():
                         help="also collect a MetaDrive teacher episode at each requested speed")
     parser.add_argument("--closed-loop-episodes", type=int, default=1)
     parser.add_argument("--speeds", nargs="+", type=float, default=(15, 20, 25))
+    parser.add_argument("--progress-interval",type=float,default=5.,
+                        help="stderr progress/heartbeat interval in seconds (default: 5)")
     args = parser.parse_args()
+    if not math.isfinite(args.progress_interval) or args.progress_interval<=0:
+        parser.error('--progress-interval must be finite and positive')
+    if args.closed_loop_episodes<1:
+        parser.error('--closed-loop-episodes must be positive')
+    if any(not math.isfinite(speed) or not 0<speed<=25 for speed in args.speeds):
+        parser.error('--speeds must be finite and in (0,25] m/s')
+    with DiagnosticProgress(args.progress_interval) as progress:
+        count=len(args.scenarios)*len(args.speeds)*args.closed_loop_episodes if args.closed_loop else 0
+        progress.update(f"开始诊断：场景={','.join(args.scenarios)}；闭环物理回合共 {count} 个。进度写入 stderr，最终 JSON 写入 stdout。",force=True)
+        try:
+            run_diagnostics(args,progress)
+        except KeyboardInterrupt:
+            progress.update('用户中断，诊断未完成；不会输出完整结果 JSON。',force=True)
+            raise
+
+
+def run_diagnostics(args,progress):
+    progress.update('加载 MetaDrive 及物理引擎',force=True)
+    from env.tasks.srairl_metadrive_world import SRAIRLProceduralWorld
     reports = []
     for scenario in args.scenarios:
+        progress.update(f"几何检查 {scenario}：初始化原生道路",force=True)
         world = SRAIRLProceduralWorld(
             scenario_type=scenario, lane_num=args.lane_num, traffic_density=0.0,
             seed=args.seed, horizon=500,
@@ -98,6 +163,7 @@ def main():
                     for speed in args.speeds
                 }
                 reports.append(geometry)
+                progress.update(f"几何检查 {scenario}/{name} 完成：曲率={geometry['max_curvature_per_m']:.6g} 1/m，连接连续={geometry['continuous']}",force=True)
         finally:
             world.close()
     closed_loop = []
@@ -105,15 +171,19 @@ def main():
         from env.tasks.srairl_interaction import SRAIRLInteractionScenario
         from env.tasks.srairl_procedural_env import SRAIRLProceduralEnv
         from datasets.srairl.metadrive_expert import collect_metadrive_expert
-        for scenario in args.scenarios:
-            for speed in args.speeds:
+        groups=len(args.scenarios)*len(args.speeds)
+        for scene_index,scenario in enumerate(args.scenarios):
+            for speed_index,speed in enumerate(args.speeds):
+                group=scene_index*len(args.speeds)+speed_index+1
+                progress.update(f"闭环组 {group}/{groups}：{scenario} {speed:g} m/s，{args.closed_loop_episodes} 回合",force=True)
                 base=SRAIRLInteractionScenario()
                 interaction=replace(base,elcv_speed=speed,rfv_speed=speed,
                     rlv_current_speed=speed,rlv_target_speed=speed)
                 env=SRAIRLProceduralEnv(scenario,args.lane_num,0.,args.seed,700,
                     interaction_scenario=interaction)
                 try:
-                    _,rows,episodes=collect_metadrive_expert(env,args.closed_loop_episodes,args.seed)
+                    _,rows,episodes=collect_metadrive_expert(env,args.closed_loop_episodes,args.seed,
+                        callback=collection_progress(progress,scenario,speed,args.closed_loop_episodes))
                     for row,episode in zip(rows,episodes):
                         desired=np.asarray(episode["desired_acceleration"],dtype=float)
                         actual=np.asarray(episode["actual_acceleration"],dtype=float)
@@ -143,8 +213,11 @@ def main():
                             "max_abs_heading_error_deg":float(np.degrees(np.max(np.abs(tracking[:,:,1])))) if tracking.size else None,
                             "validation_errors":episode["validation"]["errors"],
                         })
+                    accepted=sum(bool(row['accepted']) for row in rows)
+                    progress.update(f"闭环组 {group}/{groups} 完成：{scenario} {speed:g} m/s | 有效 {accepted}/{len(rows)}",force=True)
                 finally:
                     env.close()
+    progress.update(f"诊断结束：{len(reports)} 条路径、{len(closed_loop)} 个闭环回合；正在输出 JSON",force=True)
     print(json.dumps({
         "simulator": "MetaDrive",
         "road_geometry": __import__("env.tasks.srairl_interaction",fromlist=["ROAD_GEOMETRY_CONFIG"]).ROAD_GEOMETRY_CONFIG,
@@ -154,7 +227,7 @@ def main():
         "speeds_mps": args.speeds,
         "paths": reports,
         "closed_loop_teacher_episodes": closed_loop,
-    }, indent=2))
+    }, indent=2),flush=True)
 
 
 if __name__ == "__main__":

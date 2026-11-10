@@ -9,12 +9,55 @@ from metadrive.component.pgblock.curve import Curve
 from metadrive.component.pgblock.ramp import InRampOnStraight
 from metadrive.component.pg_space import BlockParameterSpace, Parameter, ParameterSpace, ConstantSpace
 from metadrive.component.algorithm.blocks_prob_dist import PGBlockDistConfig
+from metadrive.component.navigation_module.node_network_navigation import NodeNetworkNavigation
+
+
+class SRAIRLSpawnNavigation(NodeNetworkNavigation):
+    """Recover a Bullet localization miss only on a verified configured lane."""
+
+    def reset(self, vehicle, dest=None, random_seed=None):
+        from metadrive.utils.pg.utils import ray_localization
+        from metadrive.component.navigation_module.base_navigation import BaseNavigation
+
+        if ray_localization(vehicle.heading, vehicle.spawn_place, self.engine, use_heading_filter=False):
+            return super().reset(vehicle, dest, random_seed)
+        index = vehicle.config['spawn_lane_index']
+        if index is None:
+            return super().reset(vehicle, dest, random_seed)
+        lane = self.map.road_network.get_lane(index)
+        s, lateral = lane.local_coordinates(vehicle.spawn_place)
+        center = np.asarray(lane.position(s, lateral), dtype=float)[:2]
+        position = np.asarray(vehicle.spawn_place, dtype=float)[:2]
+        if not (0. <= s <= lane.length and abs(lateral) <= lane.width_at(s) / 2.
+                and np.linalg.norm(center - position) < .05):
+            raise ValueError(f'Background traffic spawn is outside configured lane {index}: {position}')
+        BaseNavigation.reset(self, lane)
+        destination = vehicle.config['destination'] if dest is None else dest
+        seed = self.engine.global_random_seed if random_seed is None else random_seed
+        destination = self.auto_assign_task(self.map, lane.index, destination, seed)
+        self.set_route(lane.index, destination)
 
 
 from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG
 
 CURVE_CENTER_RADIUS_M = ROAD_GEOMETRY_CONFIG["curve_center_radius_m"]
 RAMP_CENTER_RADIUS_M = ROAD_GEOMETRY_CONFIG["ramp_center_radius_m"]
+
+
+def activate_occupied_traffic_blocks(manager):
+    """Trigger native traffic when actors spawn inside a block past its entry road."""
+    occupied={tuple(v.lane_index[:2]) for v in manager.engine.agent_manager.active_agents.values()
+              if v.lane_index is not None}
+    for pending in list(manager.block_triggered_vehicles):
+        for block in manager.current_map.blocks[1:]:
+            if block.pre_block_socket.positive_road!=pending.trigger_road:continue
+            graph=block.block_network.graph
+            if any(end in graph.get(start,{}) for start,end in occupied):
+                existing={id(vehicle) for vehicle in manager._traffic_vehicles}
+                manager._traffic_vehicles.extend(vehicle for vehicle in manager.get_objects(pending.vehicles).values()
+                                                 if id(vehicle) not in existing)
+                manager.block_triggered_vehicles.remove(pending)
+            break
 
 
 class SRAIRLHighwayCurve(Curve):
@@ -316,10 +359,15 @@ class SRAIRLProceduralWorld(MultiAgentMetaDrive):
         super().setup_engine()
         from metadrive.manager.traffic_manager import PGTrafficManager
 
+        self.engine.global_config['traffic_vehicle_config']['navigation_module'] = SRAIRLSpawnNavigation
         traffic_seed=self.traffic_seed
         class SeededPGTrafficManager(PGTrafficManager):
             def seed(self, random_seed):
                 return super().seed((int(random_seed)+traffic_seed) % (2**32))
+
+            def before_step(self):
+                activate_occupied_traffic_blocks(self)
+                return super().before_step()
 
         self.engine.update_manager("traffic_manager",SeededPGTrafficManager())
         agent_manager=self.engine.agent_manager

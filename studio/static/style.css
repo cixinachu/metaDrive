@@ -3,6 +3,21 @@
 /* Keep workflow selection visually distinct from the Safe RL algorithm choice. */
 .workflowPicker,.algorithmPicker{padding:14px;border:1px solid var(--border);border-radius:9px;background:#fff;margin-bottom:14px}.workflowPicker h2,.algorithmPicker h2{margin-bottom:10px}.workflowPicker .help{margin-bottom:0}.algorithmPicker{border-color:#bfdbfe;background:#f8fbff}.algorithmScope{margin:0 0 12px;padding:9px 10px;border-radius:6px;background:#eff6ff;color:#1e40af}
 /* The setup page remains lightweight; runtime data belongs to the separate run window. */
-.monitorColumns .stats,.telemetry,#resultSection,.log{display:none!important}.simulationColumn{position:static!important}.viewport{max-width:1100px;margin:24px auto}.screen{height:min(58vh,560px);background:linear-gradient(180deg,#e8f0e2,#dbe8d3)}.sceneIllustration svg{width:min(78%,780px);height:auto;max-height:320px}.sceneIllustration svg path:first-child{stroke-width:24}.sceneIllustration svg path:last-child{stroke:#f8fafc;stroke-width:2;stroke-dasharray:18 14}.sceneIllustration{display:flex;justify-content:center;align-items:center;padding:30px}.screen #empty{max-width:750px}.runLink{display:inline-block;margin-right:10px;padding:9px 12px;border:1px solid #bfdbfe;border-radius:6px;background:#eff6ff;text-decoration:none;color:#1d4ed8}
+.setupPage .monitorColumns .stats,.setupPage .telemetry,.setupPage #resultSection,.setupPage .log{display:none!important}.setupPage .simulationColumn{position:static!important}.setupPage .viewport{max-width:1100px;margin:24px auto}.setupPage .screen{height:min(58vh,560px);background:linear-gradient(180deg,#e8f0e2,#dbe8d3)}.setupPage .sceneIllustration svg{width:min(78%,780px);height:auto;max-height:320px}.setupPage .sceneIllustration svg path:first-child{stroke-width:24}.setupPage .sceneIllustration svg path:last-child{stroke:#f8fafc;stroke-width:2;stroke-dasharray:18 14}.setupPage .sceneIllustration{display:flex;justify-content:center;align-items:center;padding:30px}.setupPage .screen #empty{max-width:750px}.setupPage .runLink{display:inline-block;margin-right:10px;padding:9px 12px;border:1px solid #bfdbfe;border-radius:6px;background:#eff6ff;text-decoration:none;color:#1d4ed8}.setupPage #preview{display:none!important}.setupPage article>.heading{display:none!important}
 
-#preview{display:none!important}article>.heading{display:none!important}
+/* Expand setup controls in the document instead of a narrow scrolling pane. */
+.setupPage main{grid-template-columns:minmax(500px,42%) minmax(0,1fr);align-items:start}.setupPage aside{position:static;top:auto;max-height:none;overflow:visible;padding:24px 28px;min-width:0}.setupPage aside label{line-height:1.6}.setupPage aside .help,.setupPage aside small{overflow-wrap:anywhere}.setupPage aside label small{display:block;margin-top:6px;color:var(--muted);line-height:1.6}.setupPage #srairlCollectAllField,.setupPage #srairlSpeedSummary,.setupPage #srairlInteractionTemplate{grid-column:1/-1}.setupPage aside select{max-width:100%}
+@media(min-width:1550px){.setupPage main{grid-template-columns:minmax(620px,40%) minmax(0,1fr)}}
+@media(max-width:1050px){.setupPage main{display:block}.setupPage aside{border-right:0;border-bottom:1px solid var(--border);padding:22px 24px}.setupPage article{padding:22px 24px}}
+@media(max-width:520px){.setupPage aside{padding:18px}.setupPage aside .grid{grid-template-columns:minmax(0,1fr)}.setupPage header{gap:12px}.setupPage .brand b{font-size:18px}}
+
+/* Let the setup preview use the entire right column at every desktop width. */
+.setupPage main{max-width:none}.setupPage article{min-width:0;padding:24px}.setupPage .monitorColumns{display:block}.setupPage .simulationColumn,.setupPage .workspace{width:100%;min-width:0}.setupPage .viewport{width:100%;max-width:none;margin:0 0 24px}.setupPage .screen{height:clamp(420px,65vh,820px)}
+@media(max-width:720px){.setupPage article{padding:18px}.setupPage .screen{height:380px}}
+
+/* Keep the desktop preview in view while scrolling through setup controls. */
+@media(min-width:1051px){.setupPage article{position:sticky;top:20px;align-self:start}.setupPage .screen{height:clamp(320px,calc(100vh - 190px),820px)}
+}
+@media(max-width:1050px){.setupPage article{position:static}}
+
+.setupPage input[type="checkbox"]{width:auto;margin-right:6px;vertical-align:middle}

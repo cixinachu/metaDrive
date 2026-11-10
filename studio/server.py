@@ -12,11 +12,10 @@ import json
 import mimetypes
 import subprocess
 import threading
-import time
 import zipfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,clean_srairl_request,clean_reward_guide_request,clean_predictor_request,clean_planner_request,clean_interaction_evaluation_request,atomic_json
+from studio.config import ROOT,RUNS,JOB_ROOTS,run_root,create_run_directory,DEFAULTS,SCENARIOS,ALGORITHM_NAMES,clean_request,clean_srairl_request,clean_reward_guide_request,clean_predictor_request,clean_planner_request,clean_interaction_evaluation_request,atomic_json
 from tasks.registry import TASK_REGISTRY
 
 from rl.algorithms import metadata as algorithm_metadata
@@ -78,8 +77,13 @@ def srairl_expert_catalog():
             with np.load(path,allow_pickle=False) as data:metadata=json.loads(str(data['metadata'].item()))
             from datasets.srairl.native_windows import native_dataset_info
             info=native_dataset_info(path,require_current=True)
-            result.append(dict(id=str(path.relative_to(ROOT)),label=f"MetaDrive 示范 · {metadata.get('scenario','?')} · {info['episodes']} episodes · {info['windows']} windows",
+            scenes=list(info['windows_by_scenario'])
+            scene_names={'straight':'直道','curve':'弯道','merge':'匝道'}
+            scene_label='＋'.join(scene_names.get(name,name) for name in scenes)
+            density=metadata.get('traffic_density','?')
+            result.append(dict(id=str(path.relative_to(ROOT)),label=f"{scene_label} · 密度 {density} · {info['episodes']} 有效回合 · {'/'.join(info['teacher_versions'])} · {path.stem}",
                 path=str(path.relative_to(ROOT)),transition_pairs=metadata.get('transition_pairs',0),scenario=metadata.get('scenario'),
+                scenarios=scenes,traffic_density=metadata.get('traffic_density'),lane_num=metadata.get('lane_num'),
                 controller=metadata.get('controller'),seed=metadata.get('seed'),episodes=info['episodes'],
                 attempted_episodes=metadata.get('episodes',info['episodes']),
                 rejected_episodes=max(0,int(metadata.get('episodes',info['episodes']))-info['episodes']),
@@ -233,8 +237,7 @@ def start_job(kind,raw):
                     raise ValueError('已有任务运行中。请先停止或等待完成。')
                 try:PROCESS.wait(timeout=5)
                 except subprocess.TimeoutExpired:raise ValueError('上一个任务正在释放资源，请稍后再试。')
-            name=f'{time.strftime("%Y%m%d_%H%M%S")}_eval_{time.time_ns()%1000000:06d}'
-            directory=run_root('eval')/name;directory.mkdir(parents=True)
+            directory=create_run_directory('eval',task,c);name=directory.name
             atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c))
             atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
             with (directory/'worker.log').open('w') as log:
@@ -254,8 +257,7 @@ def start_job(kind,raw):
                     try:PROCESS.wait(timeout=5)
                     except subprocess.TimeoutExpired:raise ValueError('上一个任务正在释放资源，请稍后再试。')
                 else:raise ValueError('已有任务运行中。请先停止或等待完成。')
-            name=f'{time.strftime("%Y%m%d_%H%M%S")}_{kind}_{time.time_ns()%1000000:06d}'
-            directory=run_root(kind)/name;directory.mkdir(parents=True)
+            directory=create_run_directory(kind,task,c);name=directory.name
             atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c))
             atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
             with (directory/'worker.log').open('w') as log:
@@ -282,8 +284,7 @@ def start_job(kind,raw):
                     try:PROCESS.wait(timeout=5)
                     except subprocess.TimeoutExpired:raise ValueError('上一个任务正在释放资源，请稍后再试。')
                 else:raise ValueError('已有任务运行中。请先停止或等待完成。')
-            name=f'{time.strftime("%Y%m%d_%H%M%S")}_{kind}_{time.time_ns()%1000000:06d}'
-            directory=run_root(kind)/name;directory.mkdir(parents=True)
+            directory=create_run_directory(kind,task,c);name=directory.name
             atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c))
             atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
             with (directory/'worker.log').open('w') as log:
@@ -311,8 +312,7 @@ def start_job(kind,raw):
                 try:PROCESS.wait(timeout=5)
                 except subprocess.TimeoutExpired:raise ValueError('上一个任务正在释放资源，请稍后再试。')
             else:raise ValueError('已有任务运行中。请先停止或等待完成。')
-        name=f'{time.strftime("%Y%m%d_%H%M%S")}_{kind}_{time.time_ns()%1000000:06d}'
-        directory=run_root(kind)/name;directory.mkdir(parents=True)
+        directory=create_run_directory(kind,task,c);name=directory.name
         atomic_json(directory/'request.json',dict(task=task,kind=kind,settings=c,model_path=str(ROOT/model['path']) if model else None))
         atomic_json(directory/'status.json',dict(state='starting',kind=kind,step=0))
         with (directory/'worker.log').open('w') as log:

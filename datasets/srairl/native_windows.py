@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+from datasets.srairl.teacher_controller import SUPPORTED_TEACHER_VERSIONS
 
 
 ROLE_ORDER = ("elcv", "rfv", "rlv_current", "rlv_target")
@@ -100,10 +101,13 @@ def native_dataset_info(path, *, require_current=False):
                     history_steps+(action_end-action_start)-FUTURE_STEPS+1)-history_steps)
                 if require_current:
                     from env.tasks.srairl_interaction import ROAD_GEOMETRY_CONFIG, REFERENCE_FRAME_VERSION
-                    if (row.get('road_geometry') != ROAD_GEOMETRY_CONFIG or row.get('teacher_version') != 'curvature-feedback-v3'
+                    if (row.get('road_geometry') != ROAD_GEOMETRY_CONFIG or row.get('teacher_version') not in SUPPORTED_TEACHER_VERSIONS
                             or row.get('reference_frame_version')!=REFERENCE_FRAME_VERSION):
                         raise ValueError('expert episodes require recollection with current road geometry and teacher')
                 rows.append(row);window_counts.append(n_windows)
+    teacher_versions=sorted({(row.get('teacher_version') or 'unknown') for row in rows})
+    if require_current and len(teacher_versions)>1:
+        raise ValueError('Different teacher versions cannot be mixed in one training dataset')
     assigned=assign_episode_splits(rows)
     windows=0;by_split={key:0 for key in ('train','validation','test')}
     by_scenario={}
@@ -121,7 +125,7 @@ def native_dataset_info(path, *, require_current=False):
     display_path=str(paths[0]) if len(paths)==1 else [str(item) for item in paths]
     return dict(path=display_path,episodes=len(rows),windows=windows,windows_by_split=by_split,
                 episode_seeds=[int(row['seed']) for row in rows],windows_by_scenario=by_scenario,
-                split_protocol='scenario_grouped_seed_70_15_15_v1')
+                teacher_versions=teacher_versions,split_protocol='scenario_grouped_seed_70_15_15_v1')
 
 
 def _coordinates(states, current_index):

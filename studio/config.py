@@ -4,6 +4,7 @@ import json
 import math
 from env.research_config import load_config, validate_config
 from rl.srairl import reward_config as srairl_defaults
+from datasets.srairl.teacher_controller import TEACHER_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT/'outputs/studio'  # Preview cache and legacy runs
@@ -14,6 +15,40 @@ JOB_ROOTS = (MODELS, RESULTS, RUNS)
 
 def run_root(kind):
     return {'train': MODELS, 'eval': RESULTS, 'preview': RUNS}[kind]
+
+
+def create_run_directory(kind, task, settings):
+    """Allocate a new, descriptive directory even for identical repeated runs."""
+    from datetime import datetime
+    import hashlib
+    import re
+    import uuid
+
+    def token(value):
+        return re.sub(r'[^a-zA-Z0-9_-]+','-',str(value)).strip('-')[:60]
+
+    operation='expert' if settings.get('operation')=='expert_collect' else task
+    parts=[datetime.now().strftime('%Y%m%d_%H%M%S_%f'),kind,token(operation)]
+    if task=='safe_rl':parts.append(token(settings.get('algorithm','sac')))
+    scenes=settings.get('scenarios') or [settings.get('scenario')]
+    scenes=[scene for scene in scenes if scene]
+    if scenes:parts.append(token('-'.join(scenes)))
+    if settings.get('traffic_density') is not None:
+        parts.append('td'+format(float(settings['traffic_density']),'.6g').replace('.','p'))
+    datasets=settings.get('dataset_id') or settings.get('expert_dataset_id')
+    if datasets:
+        fingerprint=hashlib.sha256(json.dumps(datasets,sort_keys=True).encode()).hexdigest()[:8]
+        parts.append('data'+fingerprint)
+    parts.append('seed'+str(settings.get('seed',0)))
+    root=run_root(kind)
+    root.mkdir(parents=True,exist_ok=True)
+    while True:
+        directory=root/('_'.join(parts)+'_'+uuid.uuid4().hex[:8])
+        try:
+            directory.mkdir()  # Never reuse or overwrite a previous run.
+            return directory
+        except FileExistsError:
+            continue
 
 SCENARIOS = {'straight': ('Highway 直道（训练）', 'S'), 'curve': ('Highway 弯道（迁移）', 'C'), 'merge': ('Highway 汇入（迁移）', 'r')}
 from rl.algorithms import REGISTRY
@@ -108,25 +143,34 @@ def _srairl_interaction_for_scenario(raw,lane_num,scenario_type):
 
 def clean_srairl_request(raw, kind):
     """Validate the isolated SR-AIRL Studio interface."""
+    if kind=='preview':
+        preview=clean_srairl_request({**raw,'srairl_operation':'expert_collect',
+            'srairl_demo_episodes':3,'srairl_collect_scenarios':[raw.get('srairl_scenario','straight')]},'train')
+        preview['operation']='scene_preview'
+        return preview
     if kind not in ('train','eval'):
-        raise ValueError('SR-AIRL Studio currently supports training and evaluation, not MetaDrive preview')
+        raise ValueError('SR-AIRL Studio supports preview, training and evaluation')
     operation=raw.get('srairl_operation','interaction')
     if operation not in ('interaction','expert_collect'):
         raise ValueError('未知 SR-AIRL 操作类型')
     if operation=='expert_collect':
         if kind!='train':raise ValueError('专家示范采集属于数据生成操作，请选择训练模式')
         scenario_type=raw.get('srairl_scenario','straight');lane_num=raw.get('srairl_lane_num',3)
+        if scenario_type not in ('straight','curve','merge'):raise ValueError('专家采集场景无效')
         density=raw.get('srairl_traffic_density',.15);horizon=raw.get('srairl_horizon',1000)
         episodes=raw.get('srairl_demo_episodes',10);seed=raw.get('srairl_seed',srairl_defaults.SEED)
         scenario_types=raw.get('srairl_collect_scenarios') or [scenario_type]
         if not isinstance(scenario_types,(list,tuple)) or not scenario_types or any(name not in ('straight','curve','merge') for name in scenario_types):raise ValueError('MetaDrive 专家示范支持直道、弯道和匝道汇入，可单独或批量选择')
         scenario_types=list(dict.fromkeys(scenario_types))
+        scenario_type=scenario_types[0]
         if isinstance(lane_num,bool) or not isinstance(lane_num,int) or not 2<=lane_num<=4:raise ValueError('车道数须为 2–4')
         if 'merge' in scenario_types and lane_num<3:raise ValueError('匝道汇入示范至少需要三条主路车道')
         if isinstance(density,bool) or not isinstance(density,(int,float)) or not math.isfinite(density) or not 0<=density<=1:raise ValueError('交通密度须在 [0, 1]')
         if isinstance(horizon,bool) or not isinstance(horizon,int) or not 200<=horizon<=100000:raise ValueError('示范回合步数须在 [200, 100000]，以容纳换道及后续轨迹')
         if isinstance(episodes,bool) or not isinstance(episodes,int) or not 3<=episodes<=10000:raise ValueError('每个场景至少采集 3 个 episode，才能按 episode 划分训练、验证和测试集')
         if isinstance(seed,bool) or not isinstance(seed,int) or not 0<=seed<2**32:raise ValueError('随机种子超出范围')
+        if seed+(len(scenario_types)-1)*100_000+episodes-1>=2**32:
+            raise ValueError('采集种子范围超出上限，请减小起始种子')
         view_mode=raw.get('srairl_view','topdown')
         if view_mode not in ('topdown','chase3d','first3d','bird3d'):raise ValueError('MetaDrive 画面视角无效')
         interaction_scenarios={current_scenario:_srairl_interaction_for_scenario(
@@ -137,7 +181,7 @@ def clean_srairl_request(raw, kind):
             'lane_num':lane_num,'traffic_density':float(density),'horizon':horizon,'demo_episodes':episodes,
             'seed':seed,'scene_seed':seed,'traffic_seed':(seed+1_000_003)%(2**32),'rl_seed':seed,
             'device':'cpu','srairl_view':view_mode,'dynamics_mode':'metadrive_physics',
-            'interaction_scenario':base_interaction,'expert_controller':'curvature-feedback-v3'}
+            'interaction_scenario':base_interaction,'expert_controller':TEACHER_VERSION}
     scene_source=raw.get('srairl_scene_source','procedural')
     if scene_source!='procedural':
         raise ValueError('当前 SR-AIRL 实验只使用 MetaDrive 生成的道路和车辆')
